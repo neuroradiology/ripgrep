@@ -9,15 +9,19 @@ ripgrep's regex engine uses finite automata and guarantees linear time
 searching. Because of this, features like backreferences and arbitrary
 lookaround are not supported.
 
+Note that ripgrep may abort unexpectedly when using default settings if it
+searches a file that is simultaneously truncated. This behavior can be avoided
+by passing the --no-mmap flag.
+
 Project home page: https://github.com/BurntSushi/ripgrep
 
 Use -h for short descriptions and --help for more details.";
 
 const USAGE: &'static str = "
-    rg [OPTIONS] <pattern> [<path> ...]
-    rg [OPTIONS] [-e PATTERN | -f FILE ]... [<path> ...]
-    rg [OPTIONS] --files [<path> ...]
-    rg [OPTIONS] --type-list";
+    rg [options] PATTERN [path ...]
+    rg [options] [-e PATTERN ...] [-f FILE ...] [path ...]
+    rg [options] --files [path ...]
+    rg [options] --type-list";
 
 const TEMPLATE: &'static str = "\
 {bin} {version}
@@ -32,16 +36,6 @@ ARGS:
 OPTIONS:
 {unified}";
 
-/// Build a clap application with short help strings.
-pub fn app_short() -> App<'static, 'static> {
-    app(false, |k| USAGES[k].short)
-}
-
-/// Build a clap application with long help strings.
-pub fn app_long() -> App<'static, 'static> {
-    app(true, |k| USAGES[k].long)
-}
-
 /// Build a clap application parameterized by usage strings.
 ///
 /// The function given should take a clap argument name and return a help
@@ -49,43 +43,41 @@ pub fn app_long() -> App<'static, 'static> {
 ///
 /// This is an intentionally stand-alone module so that it can be used easily
 /// in a `build.rs` script to build shell completion files.
-fn app<F>(next_line_help: bool, doc: F) -> App<'static, 'static>
-        where F: Fn(&'static str) -> &'static str {
+pub fn app() -> App<'static, 'static> {
     let arg = |name| {
-        Arg::with_name(name).help(doc(name)).next_line_help(next_line_help)
+        Arg::with_name(name)
+            .help(USAGES[name].short)
+            .long_help(USAGES[name].long)
     };
     let flag = |name| arg(name).long(name);
 
     App::new("ripgrep")
         .author(crate_authors!())
         .version(crate_version!())
+        .long_version(LONG_VERSION.as_str())
         .about(ABOUT)
         .max_term_width(100)
         .setting(AppSettings::UnifiedHelpMessage)
         .usage(USAGE)
         .template(TEMPLATE)
-        // Handle help/version manually to make their output formatting
-        // consistent with short/long views.
-        .arg(arg("help-short").short("h"))
-        .arg(flag("help"))
-        .arg(flag("version").short("V"))
+        .help_message("Prints help information. Use --help for more details.")
         // First, set up primary positional/flag arguments.
-        .arg(arg("pattern")
+        .arg(arg("PATTERN")
              .required_unless_one(&[
                 "file", "files", "help-short", "help", "regexp", "type-list",
-                "version",
+                "ripgrep-version",
              ]))
         .arg(arg("path").multiple(true))
         .arg(flag("regexp").short("e")
              .takes_value(true).multiple(true).number_of_values(1)
              .set(ArgSettings::AllowLeadingHyphen)
-             .value_name("pattern"))
+             .value_name("PATTERN"))
         .arg(flag("files")
-             // This should also conflict with `pattern`, but the first file
-             // path will actually be in `pattern`.
+             // This should also conflict with `PATTERN`, but the first file
+             // path will actually be in `PATTERN`.
              .conflicts_with_all(&["file", "regexp", "type-list"]))
         .arg(flag("type-list")
-             .conflicts_with_all(&["file", "files", "pattern", "regexp"]))
+             .conflicts_with_all(&["file", "files", "PATTERN", "regexp"]))
         // Second, set up common flags.
         .arg(flag("text").short("a"))
         .arg(flag("count").short("c"))
@@ -93,16 +85,24 @@ fn app<F>(next_line_help: bool, doc: F) -> App<'static, 'static>
              .value_name("WHEN")
              .takes_value(true)
              .hide_possible_values(true)
-             .possible_values(&["never", "auto", "always", "ansi"]))
+             .possible_values(&["never", "auto", "always", "ansi"])
+             .default_value_if("vimgrep", None, "never"))
         .arg(flag("colors").value_name("SPEC")
              .takes_value(true).multiple(true).number_of_values(1))
+        .arg(flag("encoding").short("E").value_name("ENCODING")
+             .takes_value(true).number_of_values(1))
         .arg(flag("fixed-strings").short("F"))
         .arg(flag("glob").short("g")
              .takes_value(true).multiple(true).number_of_values(1)
+             .set(ArgSettings::AllowLeadingHyphen)
+             .value_name("GLOB"))
+        .arg(flag("iglob")
+             .takes_value(true).multiple(true).number_of_values(1)
+             .set(ArgSettings::AllowLeadingHyphen)
              .value_name("GLOB"))
         .arg(flag("ignore-case").short("i"))
         .arg(flag("line-number").short("n"))
-        .arg(flag("no-line-number").short("N"))
+        .arg(flag("no-line-number").short("N").overrides_with("line-number"))
         .arg(flag("quiet").short("q"))
         .arg(flag("type").short("t")
              .takes_value(true).multiple(true).number_of_values(1)
@@ -113,7 +113,8 @@ fn app<F>(next_line_help: bool, doc: F) -> App<'static, 'static>
         .arg(flag("unrestricted").short("u")
              .multiple(true))
         .arg(flag("invert-match").short("v"))
-        .arg(flag("word-regexp").short("w"))
+        .arg(flag("word-regexp").short("w").overrides_with("line-regexp"))
+        .arg(flag("line-regexp").short("x"))
         // Third, set up less common flags.
         .arg(flag("after-context").short("A")
              .value_name("NUM").takes_value(true)
@@ -125,25 +126,32 @@ fn app<F>(next_line_help: bool, doc: F) -> App<'static, 'static>
              .value_name("NUM").takes_value(true)
              .validator(validate_number))
         .arg(flag("column"))
-        .arg(flag("context-separator").value_name("ARG").takes_value(true))
+        .arg(flag("context-separator")
+             .value_name("SEPARATOR").takes_value(true))
+        .arg(flag("dfa-size-limit")
+             .value_name("NUM+SUFFIX?").takes_value(true))
         .arg(flag("debug"))
         .arg(flag("file").short("f")
              .value_name("FILE").takes_value(true)
+             .set(ArgSettings::AllowLeadingHyphen)
              .multiple(true).number_of_values(1))
         .arg(flag("files-with-matches").short("l"))
         .arg(flag("files-without-match"))
         .arg(flag("with-filename").short("H"))
-        .arg(flag("no-filename"))
+        .arg(flag("no-filename").overrides_with("with-filename"))
         .arg(flag("heading"))
-        .arg(flag("no-heading"))
+        .arg(flag("no-heading").overrides_with("heading"))
         .arg(flag("hidden"))
         .arg(flag("ignore-file")
              .value_name("FILE").takes_value(true)
+             .set(ArgSettings::AllowLeadingHyphen)
              .multiple(true).number_of_values(1))
         .arg(flag("follow").short("L"))
         .arg(flag("max-count")
              .short("m").value_name("NUM").takes_value(true)
              .validator(validate_number))
+        .arg(flag("max-filesize")
+             .value_name("NUM+SUFFIX?").takes_value(true))
         .arg(flag("maxdepth")
              .value_name("NUM").takes_value(true)
              .validator(validate_number))
@@ -153,15 +161,25 @@ fn app<F>(next_line_help: bool, doc: F) -> App<'static, 'static>
         .arg(flag("no-ignore"))
         .arg(flag("no-ignore-parent"))
         .arg(flag("no-ignore-vcs"))
-        .arg(flag("null"))
+        .arg(flag("null").short("0"))
+        .arg(flag("only-matching").short("o").conflicts_with("replace"))
+        .arg(flag("path-separator").value_name("SEPARATOR").takes_value(true))
         .arg(flag("pretty").short("p"))
-        .arg(flag("replace").short("r").value_name("ARG").takes_value(true))
+        .arg(flag("replace").short("r")
+             .set(ArgSettings::AllowLeadingHyphen)
+             .value_name("ARG").takes_value(true))
+        .arg(flag("regex-size-limit")
+             .value_name("NUM+SUFFIX?").takes_value(true))
         .arg(flag("case-sensitive").short("s"))
         .arg(flag("smart-case").short("S"))
+        .arg(flag("sort-files"))
         .arg(flag("threads")
              .short("j").value_name("ARG").takes_value(true)
              .validator(validate_number))
-        .arg(flag("vimgrep"))
+        .arg(flag("vimgrep").overrides_with("count"))
+        .arg(flag("max-columns").short("M")
+             .value_name("NUM").takes_value(true)
+             .validator(validate_number))
         .arg(flag("type-add")
              .value_name("TYPE").takes_value(true)
              .multiple(true).number_of_values(1))
@@ -188,6 +206,24 @@ macro_rules! doc {
 }
 
 lazy_static! {
+    static ref LONG_VERSION: String = {
+        let mut features: Vec<&str> = vec![];
+
+        if cfg!(feature = "avx-accel") {
+            features.push("+AVX");
+        } else {
+            features.push("-AVX");
+        }
+
+        if cfg!(feature = "simd-accel") {
+            features.push("+SIMD");
+        } else {
+            features.push("-SIMD");
+        }
+
+        format!("{}\n{}", crate_version!(), features.join(" "))
+    };
+
     static ref USAGES: HashMap<&'static str, Usage> = {
         let mut h = HashMap::new();
         doc!(h, "help-short",
@@ -196,17 +232,18 @@ lazy_static! {
         doc!(h, "help",
              "Show verbose help output.",
              "When given, more details about flags are provided.");
-        doc!(h, "version",
+        doc!(h, "ripgrep-version",
              "Prints version information.");
 
-        doc!(h, "pattern",
+        doc!(h, "PATTERN",
              "A regular expression used for searching.",
-             "A regular expression used for searching. Multiple patterns \
-              may be given. To match a pattern beginning with a -, use [-].");
+             "A regular expression used for searching. To match a pattern \
+             beginning with a dash, use the -e/--regexp option.");
         doc!(h, "regexp",
-             "A regular expression used for searching.",
-             "A regular expression used for searching. Multiple patterns \
-              may be given. To match a pattern beginning with a -, use [-].");
+             "Use pattern to search.",
+             "Use pattern to search. This option can be provided multiple \
+             times, where all patterns given are searched. This is also \
+             useful when searching for patterns that start with a dash.");
         doc!(h, "path",
              "A file or directory to search.",
              "A file or directory to search. Directories are searched \
@@ -226,26 +263,34 @@ lazy_static! {
              "Only show count of matches for each file.");
         doc!(h, "color",
              "When to use color. [default: auto]",
-             "When to use color in the output. The possible values are \
-              never, auto, always or ansi. The default is auto. When always \
-              is used, coloring is attempted based on your environment. When \
-              ansi used, coloring is forcefully done using ANSI escape color \
-              codes.");
+             "When to use color in the output. The possible values are never, \
+             auto, always or ansi. The default is auto. When always is used, \
+             coloring is attempted based on your environment. When ansi is \
+             used, coloring is forcefully done using ANSI escape color \
+             codes.");
         doc!(h, "colors",
              "Configure color settings and styles.",
              "This flag specifies color settings for use in the output. \
               This flag may be provided multiple times. Settings are applied \
               iteratively. Colors are limited to one of eight choices: \
               red, blue, green, cyan, magenta, yellow, white and black. \
-              Styles are limited to either nobold or bold.\n\nThe format \
-              of the flag is {type}:{attribute}:{value}. {type} should be \
-              one of path, line or match. {attribute} can be fg, bg or style. \
-              {value} is either a color (for fg and bg) or a text style. \
-              A special format, {type}:none, will clear all color settings \
-              for {type}.\n\nFor example, the following command will change \
-              the match color to magenta and the background color for line \
-              numbers to yellow:\n\n\
+              Styles are limited to nobold, bold, nointense or intense.\n\n\
+              The format of the flag is {type}:{attribute}:{value}. {type} \
+              should be one of path, line, column or match. {attribute} can \
+              be fg, bg or style. {value} is either a color (for fg and bg) \
+              or a text style. A special format, {type}:none, will clear all \
+              color settings for {type}.\n\nFor example, the following \
+              command will change the match color to magenta and the \
+              background color for line numbers to yellow:\n\n\
               rg --colors 'match:fg:magenta' --colors 'line:bg:yellow' foo.");
+        doc!(h, "encoding",
+             "Specify the text encoding of files to search.",
+             "Specify the text encoding that ripgrep will use on all files \
+              searched. The default value is 'auto', which will cause ripgrep \
+              to do a best effort automatic detection of encoding on a \
+              per-file basis. Other supported values can be found in the list \
+              of labels here: \
+              https://encoding.spec.whatwg.org/#concept-encoding-get");
         doc!(h, "fixed-strings",
              "Treat the pattern as a literal string.",
              "Treat the pattern as a literal string instead of a regular \
@@ -258,6 +303,13 @@ lazy_static! {
               ignore logic. Multiple glob flags may be used. Globbing \
               rules match .gitignore globs. Precede a glob with a ! \
               to exclude it.");
+        doc!(h, "iglob",
+             "Include or exclude files/directories case insensitively.",
+             "Include or exclude files/directories for searching that \
+              match the given glob. This always overrides any other \
+              ignore logic. Multiple glob flags may be used. Globbing \
+              rules match .gitignore globs. Precede a glob with a ! \
+              to exclude it. Globs are matched case insensitively.");
         doc!(h, "ignore-case",
              "Case insensitive search.",
              "Case insensitive search. This is overridden by \
@@ -301,6 +353,10 @@ lazy_static! {
              "Only show matches surrounded by word boundaries. This is \
               equivalent to putting \\b before and after all of the search \
               patterns.");
+        doc!(h, "line-regexp",
+             "Only show matches surrounded by line boundaries.",
+             "Only show matches surrounded by line boundaries. This is \
+              equivalent to putting ^...$ around all of the search patterns.");
 
         doc!(h, "after-context",
              "Show NUM lines after each match.");
@@ -312,7 +368,8 @@ lazy_static! {
              "Show column numbers",
              "Show column numbers (1-based). This only shows the column \
               numbers for the first match on each line. This does not try \
-              to account for Unicode. One byte is equal to one column.");
+              to account for Unicode. One byte is equal to one column. This \
+              implies --line-number.");
         doc!(h, "context-separator",
              "Set the context separator string. [default: --]",
              "The string used to separate non-contiguous context lines in the \
@@ -321,6 +378,13 @@ lazy_static! {
         doc!(h, "debug",
              "Show debug messages.",
              "Show debug messages. Please use this when filing a bug report.");
+        doc!(h, "dfa-size-limit",
+             "The upper size limit of the generated dfa.",
+             "The upper size limit of the generated dfa. The default limit is \
+              10M. This should only be changed on very large regex inputs \
+              where the (slower) fallback regex engine may otherwise be used. \
+              \n\nThe argument accepts the same size suffixes as allowed in \
+              the 'max-filesize' argument.");
         doc!(h, "file",
              "Search for patterns from the given file.",
              "Search for patterns from the given file, with one pattern per \
@@ -329,9 +393,9 @@ lazy_static! {
               provided are searched. Empty pattern lines will match all input \
               lines, and the newline is not counted as part of the pattern.");
         doc!(h, "files-with-matches",
-             "Only show the path of each file with at least one match.");
+             "Only show the paths with at least one match.");
         doc!(h, "files-without-match",
-             "Only show the path of each file that contains zero matches.");
+             "Only show the paths that contains zero matches.");
         doc!(h, "with-filename",
              "Show file name for each match.",
              "Prefix each match with the file name that contains it. This is \
@@ -367,6 +431,14 @@ lazy_static! {
         doc!(h, "max-count",
              "Limit the number of matches.",
              "Limit the number of matching lines per file searched to NUM.");
+        doc!(h, "max-filesize",
+             "Ignore files larger than NUM in size.",
+             "Ignore files larger than NUM in size. Does not ignore \
+              directories. \
+              \n\nThe input format accepts suffixes of K, M or G which \
+              correspond to kilobytes, megabytes and gigabytes. If no suffix \
+              is provided the input is treated as bytes. \
+              \n\nExample: --max-filesize 50K or --max-filesize 80M");
         doc!(h, "maxdepth",
              "Descend at most NUM directories.",
              "Limit the depth of directory traversal to NUM levels beyond \
@@ -409,14 +481,33 @@ lazy_static! {
               printing a list of matching files such as with --count, \
               --files-with-matches and --files. This option is useful for use \
               with xargs.");
+        doc!(h, "only-matching",
+             "Print only matched parts of a line.",
+             "Print only the matched (non-empty) parts of a matching line, \
+              with each such part on a separate output line.");
+        doc!(h, "path-separator",
+             "Path separator to use when printing file paths.",
+             "The path separator to use when printing file paths. This \
+              defaults to your platform's path separator, which is / on Unix \
+              and \\ on Windows. This flag is intended for overriding the \
+              default when the environment demands it (e.g., cygwin). A path \
+              separator is limited to a single byte.");
         doc!(h, "pretty",
-             "Alias for --color always --heading -n.");
+             "Alias for --color always --heading --line-number.");
         doc!(h, "replace",
              "Replace matches with string given.",
              "Replace every match with the string given when printing \
               results. Neither this flag nor any other flag will modify your \
               files.\n\nCapture group indices (e.g., $5) and names \
-              (e.g., $foo) are supported in the replacement string.");
+              (e.g., $foo) are supported in the replacement string.\n\n\
+              Note that the replacement by default replaces each match, and \
+              NOT the entire line. To replace the entire line, you should \
+              match the entire line.");
+        doc!(h, "regex-size-limit",
+             "The upper size limit of the compiled regex.",
+             "The upper size limit of the compiled regex. The default limit \
+              is 10M. \n\nThe argument accepts the same size suffixes as \
+              allowed in the 'max-filesize' argument.");
         doc!(h, "case-sensitive",
              "Search case sensitively.",
              "Search case sensitively. This overrides -i/--ignore-case and \
@@ -426,6 +517,10 @@ lazy_static! {
              "Searches case insensitively if the pattern is all lowercase. \
               Search case sensitively otherwise. This is overridden by \
               either -s/--case-sensitive or -i/--ignore-case.");
+        doc!(h, "sort-files",
+             "Sort results by file path. Implies --threads=1.",
+             "Sort results by file path. Note that this currently \
+              disables all parallelism and runs search in a single thread.");
         doc!(h, "threads",
              "The approximate number of threads to use.",
              "The approximate number of threads to use. A value of 0 (which \
@@ -436,6 +531,11 @@ lazy_static! {
              "Show results with every match on its own line, including \
               line numbers and column numbers. With this option, a line with \
               more than one match will be printed more than once.");
+        doc!(h, "max-columns",
+             "Don't print lines longer than this limit in bytes.",
+             "Don't print lines longer than this limit in bytes. Longer lines \
+              are omitted, and only the number of matches in that line is \
+              printed.");
 
         doc!(h, "type-add",
              "Add a new glob for a file type.",
@@ -445,11 +545,24 @@ lazy_static! {
               globs defined inside of ripgrep.\n\nNote that this MUST be \
               passed to every invocation of ripgrep. Type settings are NOT \
               persisted.\n\nExample: \
-              rg --type-add 'foo:*.foo' -tfoo PATTERN.");
+              rg --type-add 'foo:*.foo' -tfoo PATTERN.\n\n\
+              --type-add can also be used to include rules from other types \
+              with the special include directive. The include directive \
+              permits specifying one or more other type names (separated by a \
+              comma) that have been defined and its rules will automatically \
+              be imported into the type specified. For example, to create a \
+              type called src that matches C++, Python and Markdown files, \
+              one can use:\n\n\
+              --type-add 'src:include:cpp,py,md'\n\n\
+              Additional glob rules can still be added to the src type by \
+              using the --type-add flag again:\n\n\
+              --type-add 'src:include:cpp,py,md' --type-add 'src:*.foo'\n\n\
+              Note that type names must consist only of Unicode letters or \
+              numbers. Punctuation characters are not allowed.");
         doc!(h, "type-clear",
              "Clear globs for given file type.",
              "Clear the file type globs previously defined for TYPE. This \
-              only clears the default tpye definitions that are found inside \
+              only clears the default type definitions that are found inside \
               of ripgrep.\n\nNote that this MUST be passed to every \
               invocation of ripgrep. Type settings are NOT persisted.");
 

@@ -5,14 +5,17 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::ops;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap;
+use encoding_rs::Encoding;
 use env_logger;
 use grep::{Grep, GrepBuilder};
 use log;
 use num_cpus;
 use regex;
+use same_file;
 use termcolor;
 
 use app;
@@ -24,20 +27,20 @@ use printer::{ColorSpecs, Printer};
 use unescape::unescape;
 use worker::{Worker, WorkerBuilder};
 
-use {Result, version};
+use Result;
 
-/// Args are transformed/normalized from ArgMatches.
+/// `Args` are transformed/normalized from `ArgMatches`.
 #[derive(Debug)]
 pub struct Args {
     paths: Vec<PathBuf>,
     after_context: usize,
     before_context: usize,
-    color: bool,
     color_choice: termcolor::ColorChoice,
     colors: ColorSpecs,
     column: bool,
     context_separator: Vec<u8>,
     count: bool,
+    encoding: Option<&'static Encoding>,
     files_with_matches: bool,
     files_without_matches: bool,
     eol: u8,
@@ -51,7 +54,9 @@ pub struct Args {
     invert_match: bool,
     line_number: bool,
     line_per_match: bool,
+    max_columns: Option<usize>,
     max_count: Option<u64>,
+    max_filesize: Option<u64>,
     maxdepth: Option<usize>,
     mmap: bool,
     no_ignore: bool,
@@ -59,8 +64,13 @@ pub struct Args {
     no_ignore_vcs: bool,
     no_messages: bool,
     null: bool,
+    only_matching: bool,
+    path_separator: Option<u8>,
     quiet: bool,
+    quiet_matched: QuietMatched,
     replace: Option<Vec<u8>>,
+    sort_files: bool,
+    stdout_handle: Option<same_file::Handle>,
     text: bool,
     threads: usize,
     type_list: bool,
@@ -77,21 +87,7 @@ impl Args {
     ///
     /// Also, initialize a global logger.
     pub fn parse() -> Result<Args> {
-        let matches = app::app_short().get_matches();
-        if matches.is_present("help-short") {
-            let _ = ::app::app_short().print_help();
-            let _ = println!("");
-            process::exit(0);
-        }
-        if matches.is_present("help") {
-            let _ = ::app::app_long().print_help();
-            let _ = println!("");
-            process::exit(0);
-        }
-        if matches.is_present("version") {
-            println!("ripgrep {}", crate_version!());
-            process::exit(0);
-        }
+        let matches = app::app().get_matches();
 
         let mut logb = env_logger::LogBuilder::new();
         if matches.is_present("debug") {
@@ -125,6 +121,15 @@ impl Args {
         self.quiet
     }
 
+    /// Returns a thread safe boolean for determining whether to quit a search
+    /// early when quiet mode is enabled.
+    ///
+    /// If quiet mode is disabled, then QuietMatched.has_match always returns
+    /// false.
+    pub fn quiet_matched(&self) -> QuietMatched {
+        self.quiet_matched.clone()
+    }
+
     /// Create a new printer of individual search results that writes to the
     /// writer given.
     pub fn printer<W: termcolor::WriteColor>(&self, wtr: W) -> Printer<W> {
@@ -136,7 +141,10 @@ impl Args {
             .heading(self.heading)
             .line_per_match(self.line_per_match)
             .null(self.null)
-            .with_filename(self.with_filename);
+            .only_matching(self.only_matching)
+            .path_separator(self.path_separator)
+            .with_filename(self.with_filename)
+            .max_columns(self.max_columns);
         if let Some(ref rep) = self.replace {
             p = p.replace(rep.clone());
         }
@@ -145,7 +153,12 @@ impl Args {
 
     /// Retrieve the configured file separator.
     pub fn file_separator(&self) -> Option<Vec<u8>> {
-        if self.heading && !self.count && !self.files_with_matches && !self.files_without_matches {
+        let use_heading_sep =
+            self.heading
+            && !self.count
+            && !self.files_with_matches
+            && !self.files_without_matches;
+        if use_heading_sep {
             Some(b"".to_vec())
         } else if self.before_context > 0 || self.after_context > 0 {
             Some(self.context_separator.clone())
@@ -160,8 +173,19 @@ impl Args {
     }
 
     /// Create a new writer for single-threaded searching with color support.
-    pub fn stdout(&self) -> termcolor::Stdout {
-        termcolor::Stdout::new(self.color_choice)
+    pub fn stdout(&self) -> termcolor::StandardStream {
+        termcolor::StandardStream::stdout(self.color_choice)
+    }
+
+    /// Returns a handle to stdout for filtering search.
+    ///
+    /// A handle is returned if and only if ripgrep's stdout is being
+    /// redirected to a file. The handle returned corresponds to that file.
+    ///
+    /// This can be used to ensure that we do not attempt to search a file
+    /// that ripgrep is writing to.
+    pub fn stdout_handle(&self) -> Option<&same_file::Handle> {
+        self.stdout_handle.as_ref()
     }
 
     /// Create a new buffer writer for multi-threaded searching with color
@@ -190,6 +214,7 @@ impl Args {
             .after_context(self.after_context)
             .before_context(self.before_context)
             .count(self.count)
+            .encoding(self.encoding)
             .files_with_matches(self.files_with_matches)
             .files_without_matches(self.files_without_matches)
             .eol(self.eol)
@@ -252,6 +277,7 @@ impl Args {
         wd.follow_links(self.follow);
         wd.hidden(!self.hidden);
         wd.max_depth(self.maxdepth);
+        wd.max_filesize(self.max_filesize);
         wd.overrides(self.glob_overrides.clone());
         wd.types(self.types.clone());
         wd.git_global(!self.no_ignore && !self.no_ignore_vcs);
@@ -260,12 +286,15 @@ impl Args {
         wd.ignore(!self.no_ignore);
         wd.parents(!self.no_ignore_parent);
         wd.threads(self.threads());
+        if self.sort_files {
+            wd.sort_by(|a, b| a.cmp(b));
+        }
         wd
     }
 }
 
-/// ArgMatches wraps clap::ArgMatches and provides semantic meaning to several
-/// options/flags.
+/// `ArgMatches` wraps `clap::ArgMatches` and provides semantic meaning to
+/// several options/flags.
 struct ArgMatches<'a>(clap::ArgMatches<'a>);
 
 impl<'a> ops::Deref for ArgMatches<'a> {
@@ -278,19 +307,21 @@ impl<'a> ArgMatches<'a> {
     /// configuration.
     fn to_args(&self) -> Result<Args> {
         let paths = self.paths();
+        let line_number = self.line_number(&paths);
         let mmap = try!(self.mmap(&paths));
         let with_filename = self.with_filename(&paths);
         let (before_context, after_context) = try!(self.contexts());
+        let quiet = self.is_present("quiet");
         let args = Args {
             paths: paths,
             after_context: after_context,
             before_context: before_context,
-            color: self.color(),
             color_choice: self.color_choice(),
             colors: try!(self.color_specs()),
             column: self.column(),
             context_separator: self.context_separator(),
             count: self.is_present("count"),
+            encoding: try!(self.encoding()),
             files_with_matches: self.is_present("files-with-matches"),
             files_without_matches: self.is_present("files-without-match"),
             eol: b'\n',
@@ -302,9 +333,11 @@ impl<'a> ArgMatches<'a> {
             hidden: self.hidden(),
             ignore_files: self.ignore_files(),
             invert_match: self.is_present("invert-match"),
-            line_number: self.line_number(),
+            line_number: line_number,
             line_per_match: self.is_present("vimgrep"),
+            max_columns: try!(self.usize_of("max-columns")),
             max_count: try!(self.usize_of("max-count")).map(|max| max as u64),
+            max_filesize: try!(self.max_filesize()),
             maxdepth: try!(self.usize_of("maxdepth")),
             mmap: mmap,
             no_ignore: self.no_ignore(),
@@ -312,8 +345,13 @@ impl<'a> ArgMatches<'a> {
             no_ignore_vcs: self.no_ignore_vcs(),
             no_messages: self.is_present("no-messages"),
             null: self.is_present("null"),
-            quiet: self.is_present("quiet"),
+            only_matching: self.is_present("only-matching"),
+            path_separator: try!(self.path_separator()),
+            quiet: quiet,
+            quiet_matched: QuietMatched::new(quiet),
             replace: self.replace(),
+            sort_files: self.is_present("sort-files"),
+            stdout_handle: self.stdout_handle(),
             text: self.text(),
             threads: try!(self.threads()),
             type_list: self.is_present("type-list"),
@@ -337,7 +375,7 @@ impl<'a> ArgMatches<'a> {
         if self.is_present("file")
             || self.is_present("files")
             || self.is_present("regexp") {
-            if let Some(path) = self.value_of_os("pattern") {
+            if let Some(path) = self.value_of_os("PATTERN") {
                 paths.insert(0, Path::new(path).to_path_buf());
             }
         }
@@ -353,8 +391,8 @@ impl<'a> ArgMatches<'a> {
             self.values_of_os("file").map_or(false, |mut files| {
                 files.any(|f| f == "-")
             });
-        let search_cwd = atty::on_stdin()
-            || !atty::stdin_is_readable()
+        let search_cwd = atty::is(atty::Stream::Stdin)
+            || !stdin_is_readable()
             || (self.is_present("file") && file_is_stdin)
             || self.is_present("files")
             || self.is_present("type-list");
@@ -389,15 +427,19 @@ impl<'a> ArgMatches<'a> {
     ///
     /// Note that if -F/--fixed-strings is set, then all patterns will be
     /// escaped. Similarly, if -w/--word-regexp is set, then all patterns
-    /// are surrounded by `\b`.
+    /// are surrounded by `\b`, and if -x/--line-regexp is set, then all
+    /// patterns are surrounded by `^...$`.
     ///
     /// If any pattern is invalid UTF-8, then an error is returned.
     fn patterns(&self) -> Result<Vec<String>> {
+        if self.is_present("files") || self.is_present("type-list") {
+            return Ok(vec![self.empty_pattern()]);
+        }
         let mut pats = vec![];
         match self.values_of_os("regexp") {
             None => {
                 if self.values_of_os("file").is_none() {
-                    if let Some(os_pat) = self.value_of_os("pattern") {
+                    if let Some(os_pat) = self.value_of_os("PATTERN") {
                         pats.push(try!(self.os_str_pattern(os_pat)));
                     }
                 }
@@ -429,7 +471,7 @@ impl<'a> ArgMatches<'a> {
         Ok(pats)
     }
 
-    /// Converts an OsStr pattern to a String pattern, including word
+    /// Converts an OsStr pattern to a String pattern, including line/word
     /// boundaries or escapes if applicable.
     ///
     /// If the pattern is not valid UTF-8, then an error is returned.
@@ -438,10 +480,12 @@ impl<'a> ArgMatches<'a> {
         Ok(self.str_pattern(s))
     }
 
-    /// Converts a &str pattern to a String pattern, including word
+    /// Converts a &str pattern to a String pattern, including line/word
     /// boundaries or escapes if applicable.
     fn str_pattern(&self, pat: &str) -> String {
-        let s = self.word_pattern(self.literal_pattern(pat.to_string()));
+        let litpat = self.literal_pattern(pat.to_string());
+        let s = self.line_pattern(self.word_pattern(litpat));
+
         if s.is_empty() {
             self.empty_pattern()
         } else {
@@ -454,7 +498,7 @@ impl<'a> ArgMatches<'a> {
     /// unchanged.
     fn literal_pattern(&self, pat: String) -> String {
         if self.is_present("fixed-strings") {
-            regex::quote(&pat)
+            regex::escape(&pat)
         } else {
             pat
         }
@@ -464,7 +508,17 @@ impl<'a> ArgMatches<'a> {
     /// flag is set. Otherwise, the pattern is returned unchanged.
     fn word_pattern(&self, pat: String) -> String {
         if self.is_present("word-regexp") {
-            format!(r"\b{}\b", pat)
+            format!(r"\b(?:{})\b", pat)
+        } else {
+            pat
+        }
+    }
+
+    /// Returns the given pattern as a line pattern if the -x/--line-regexp
+    /// flag is set. Otherwise, the pattern is returned unchanged.
+    fn line_pattern(&self, pat: String) -> String {
+        if self.is_present("line-regexp") {
+            format!(r"^(?:{})$", pat)
         } else {
             pat
         }
@@ -489,9 +543,32 @@ impl<'a> ArgMatches<'a> {
             false
         } else {
             self.is_present("with-filename")
+            || self.is_present("vimgrep")
             || paths.len() > 1
             || paths.get(0).map_or(false, |p| p.is_dir())
         }
+    }
+
+    /// Returns a handle to stdout for filtering search.
+    ///
+    /// A handle is returned if and only if ripgrep's stdout is being
+    /// redirected to a file. The handle returned corresponds to that file.
+    ///
+    /// This can be used to ensure that we do not attempt to search a file
+    /// that ripgrep is writing to.
+    fn stdout_handle(&self) -> Option<same_file::Handle> {
+        let h = match same_file::Handle::stdout() {
+            Err(_) => return None,
+            Ok(h) => h,
+        };
+        let md = match h.as_file().metadata() {
+            Err(_) => return None,
+            Ok(md) => md,
+        };
+        if !md.is_file() {
+            return None;
+        }
+        Some(h)
     }
 
     /// Returns true if and only if memory map searching should be tried.
@@ -500,12 +577,17 @@ impl<'a> ArgMatches<'a> {
     /// will need to search.
     fn mmap(&self, paths: &[PathBuf]) -> Result<bool> {
         let (before, after) = try!(self.contexts());
+        let enc = try!(self.encoding());
         Ok(if before > 0 || after > 0 || self.is_present("no-mmap") {
             false
         } else if self.is_present("mmap") {
             true
         } else if cfg!(target_os = "macos") {
             // On Mac, memory maps appear to suck. Neat.
+            false
+        } else if enc.is_some() {
+            // There's no practical way to transcode a memory map that isn't
+            // isomorphic to searching over io::Read.
             false
         } else {
             // If we're only searching a few paths and all of them are
@@ -515,12 +597,14 @@ impl<'a> ArgMatches<'a> {
     }
 
     /// Returns true if and only if line numbers should be shown.
-    fn line_number(&self) -> bool {
+    fn line_number(&self, paths: &[PathBuf]) -> bool {
         if self.is_present("no-line-number") || self.is_present("count") {
             false
         } else {
-            self.is_present("line-number")
-            || atty::on_stdout()
+            let only_stdin = paths == &[Path::new("-")];
+            (atty::is(atty::Stream::Stdout) && !only_stdin)
+            || self.is_present("line-number")
+            || self.is_present("column")
             || self.is_present("pretty")
             || self.is_present("vimgrep")
         }
@@ -534,11 +618,11 @@ impl<'a> ArgMatches<'a> {
     /// Returns true if and only if matches should be grouped with file name
     /// headings.
     fn heading(&self) -> bool {
-        if self.is_present("no-heading") {
+        if self.is_present("no-heading") || self.is_present("vimgrep") {
             false
         } else {
-            self.is_present("heading")
-            || atty::on_stdout()
+            atty::is(atty::Stream::Stdout)
+            || self.is_present("heading")
             || self.is_present("pretty")
         }
     }
@@ -553,6 +637,25 @@ impl<'a> ArgMatches<'a> {
         match self.value_of_lossy("context-separator") {
             None => b"--".to_vec(),
             Some(sep) => unescape(&sep),
+        }
+    }
+
+    /// Returns the unescaped path separator in UTF-8 bytes.
+    fn path_separator(&self) -> Result<Option<u8>> {
+        match self.value_of_lossy("path-separator") {
+            None => Ok(None),
+            Some(sep) => {
+                let sep = unescape(&sep);
+                if sep.is_empty() {
+                    Ok(None)
+                } else if sep.len() > 1 {
+                    Err(From::from(format!(
+                        "A path separator must be exactly one byte, but \
+                         the given separator is {} bytes.", sep.len())))
+                } else {
+                    Ok(Some(sep[0]))
+                }
+            }
         }
     }
 
@@ -573,23 +676,6 @@ impl<'a> ArgMatches<'a> {
         })
     }
 
-    /// Returns true if and only if ripgrep should color its output.
-    fn color(&self) -> bool {
-        let preference = match self.0.value_of_lossy("color") {
-            None => "auto".to_string(),
-            Some(v) => v.into_owned(),
-        };
-        if preference == "always" {
-            true
-        } else if self.is_present("vimgrep") {
-            false
-        } else if preference == "auto" {
-            atty::on_stdout() || self.is_present("pretty")
-        } else {
-            false
-        }
-    }
-
     /// Returns the user's color choice based on command line parameters and
     /// environment.
     fn color_choice(&self) -> termcolor::ColorChoice {
@@ -601,10 +687,8 @@ impl<'a> ArgMatches<'a> {
             termcolor::ColorChoice::Always
         } else if preference == "ansi" {
             termcolor::ColorChoice::AlwaysAnsi
-        } else if self.is_present("vimgrep") {
-            termcolor::ColorChoice::Never
         } else if preference == "auto" {
-            if atty::on_stdout() || self.is_present("pretty") {
+            if atty::is(atty::Stream::Stdout) || self.is_present("pretty") {
                 termcolor::ColorChoice::Auto
             } else {
                 termcolor::ColorChoice::Never
@@ -621,10 +705,11 @@ impl<'a> ArgMatches<'a> {
     fn color_specs(&self) -> Result<ColorSpecs> {
         // Start with a default set of color specs.
         let mut specs = vec![
-            "path:fg:green".parse().unwrap(),
-            "path:style:bold".parse().unwrap(),
-            "line:fg:blue".parse().unwrap(),
-            "line:style:bold".parse().unwrap(),
+            #[cfg(unix)]
+            "path:fg:magenta".parse().unwrap(),
+            #[cfg(windows)]
+            "path:fg:cyan".parse().unwrap(),
+            "line:fg:green".parse().unwrap(),
             "match:fg:red".parse().unwrap(),
             "match:style:bold".parse().unwrap(),
         ];
@@ -634,8 +719,34 @@ impl<'a> ArgMatches<'a> {
         Ok(ColorSpecs::new(&specs))
     }
 
+    /// Return the text encoding specified.
+    ///
+    /// If the label given by the caller doesn't correspond to a valid
+    /// supported encoding (and isn't `auto`), then return an error.
+    ///
+    /// A `None` encoding implies that the encoding should be automatically
+    /// detected on a per-file basis.
+    fn encoding(&self) -> Result<Option<&'static Encoding>> {
+        match self.0.value_of_lossy("encoding") {
+            None => Ok(None),
+            Some(label) => {
+                if label == "auto" {
+                    return Ok(None);
+                }
+                match Encoding::for_label_no_replacement(label.as_bytes()) {
+                    Some(enc) => Ok(Some(enc)),
+                    None => Err(From::from(
+                        format!("unsupported encoding: {}", label))),
+                }
+            }
+        }
+    }
+
     /// Returns the approximate number of threads that ripgrep should use.
     fn threads(&self) -> Result<usize> {
+        if self.is_present("sort-files") {
+            return Ok(1);
+        }
         let threads = try!(self.usize_of("threads")).unwrap_or(0);
         Ok(if threads == 0 {
             cmp::min(12, num_cpus::get())
@@ -656,18 +767,32 @@ impl<'a> ArgMatches<'a> {
         let casei =
             self.is_present("ignore-case")
             && !self.is_present("case-sensitive");
-        GrepBuilder::new(&try!(self.pattern()))
+        let mut gb = GrepBuilder::new(&try!(self.pattern()))
             .case_smart(smart)
             .case_insensitive(casei)
-            .line_terminator(b'\n')
-            .build()
-            .map_err(From::from)
+            .line_terminator(b'\n');
+
+        if let Some(limit) = try!(self.dfa_size_limit()) {
+            gb = gb.dfa_size_limit(limit);
+        }
+        if let Some(limit) = try!(self.regex_size_limit()) {
+            gb = gb.size_limit(limit);
+        }
+        gb.build().map_err(From::from)
     }
 
     /// Builds the set of glob overrides from the command line flags.
     fn overrides(&self) -> Result<Override> {
         let mut ovr = OverrideBuilder::new(try!(env::current_dir()));
         for glob in self.values_of_lossy_vec("glob") {
+            try!(ovr.add(&glob));
+        }
+        // this is smelly. In the long run it might make sense
+        // to change overridebuilder to be like globsetbuilder
+        // but this would be a breaking change to the ignore crate
+        // so it is being shelved for now...
+        try!(ovr.case_insensitive(true));
+        for glob in self.values_of_lossy_vec("iglob") {
             try!(ovr.add(&glob));
         }
         ovr.build().map_err(From::from)
@@ -690,6 +815,64 @@ impl<'a> ArgMatches<'a> {
             btypes.negate(&ty);
         }
         btypes.build().map_err(From::from)
+    }
+
+    /// Parses an argument of the form `[0-9]+(KMG)?`.
+    ///
+    /// This always returns the result as a type `u64`. This must be converted
+    /// to the appropriate type by the caller.
+    fn parse_human_readable_size_arg(
+        &self,
+        arg_name: &str,
+    ) -> Result<Option<u64>> {
+        let arg_value = match self.value_of_lossy(arg_name) {
+            Some(x) => x,
+            None => return Ok(None)
+        };
+        let re = regex::Regex::new("^([0-9]+)([KMG])?$").unwrap();
+        let caps = try!(
+            re.captures(&arg_value).ok_or_else(|| {
+                format!("invalid format for {}", arg_name)
+            }));
+
+        let value = try!(caps[1].parse::<u64>());
+        let suffix = caps.get(2).map(|x| x.as_str());
+
+        let v_10 = value.checked_mul(1024);
+        let v_20 = v_10.and_then(|x| x.checked_mul(1024));
+        let v_30 = v_20.and_then(|x| x.checked_mul(1024));
+
+        let try_suffix = |x: Option<u64>| {
+            if x.is_some() {
+                Ok(x)
+            } else {
+                Err(From::from(format!("number too large for {}", arg_name)))
+            }
+        };
+        match suffix {
+            None      => Ok(Some(value)),
+            Some("K") => try_suffix(v_10),
+            Some("M") => try_suffix(v_20),
+            Some("G") => try_suffix(v_30),
+            _ => Err(From::from(format!("invalid suffix for {}", arg_name)))
+        }
+    }
+
+    /// Parse the dfa-size-limit argument option into a byte count.
+    fn dfa_size_limit(&self) -> Result<Option<usize>> {
+        let r = try!(self.parse_human_readable_size_arg("dfa-size-limit"));
+        human_readable_to_usize("dfa-size-limit", r)
+    }
+
+    /// Parse the regex-size-limit argument option into a byte count.
+    fn regex_size_limit(&self) -> Result<Option<usize>> {
+        let r = try!(self.parse_human_readable_size_arg("regex-size-limit"));
+        human_readable_to_usize("regex-size-limit", r)
+    }
+
+    /// Parses the max-filesize argument option into a byte count.
+    fn max_filesize(&self) -> Result<Option<u64>> {
+        self.parse_human_readable_size_arg("max-filesize")
     }
 
     /// Returns true if ignore files should be ignored.
@@ -723,7 +906,7 @@ impl<'a> ArgMatches<'a> {
     /// Like values_of_lossy, but returns an empty vec if the flag is not
     /// present.
     fn values_of_lossy_vec(&self, name: &str) -> Vec<String> {
-        self.values_of_lossy(name).unwrap_or(vec![])
+        self.values_of_lossy(name).unwrap_or_else(Vec::new)
     }
 
     /// Safely reads an arg value with the given name, and if it's present,
@@ -745,4 +928,85 @@ fn pattern_to_str(s: &OsStr) -> Result<&str> {
              bytes in a pattern (e.g., \\xFF).",
              s.to_string_lossy()))),
     }
+}
+
+/// A simple thread safe abstraction for determining whether a search should
+/// stop if the user has requested quiet mode.
+#[derive(Clone, Debug)]
+pub struct QuietMatched(Arc<Option<AtomicBool>>);
+
+impl QuietMatched {
+    /// Create a new QuietMatched value.
+    ///
+    /// If quiet is true, then set_match and has_match will reflect whether
+    /// a search should quit or not because it found a match.
+    ///
+    /// If quiet is false, then set_match is always a no-op and has_match
+    /// always returns false.
+    fn new(quiet: bool) -> QuietMatched {
+        let atomic = if quiet { Some(AtomicBool::new(false)) } else { None };
+        QuietMatched(Arc::new(atomic))
+    }
+
+    /// Returns true if and only if quiet mode is enabled and a match has
+    /// occurred.
+    pub fn has_match(&self) -> bool {
+        match *self.0 {
+            None => false,
+            Some(ref matched) => matched.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Sets whether a match has occurred or not.
+    ///
+    /// If quiet mode is disabled, then this is a no-op.
+    pub fn set_match(&self, yes: bool) -> bool {
+        match *self.0 {
+            None => false,
+            Some(_) if !yes => false,
+            Some(ref m) => { m.store(true, Ordering::SeqCst); true }
+        }
+    }
+}
+
+/// Convert the result of a `parse_human_readable_size_arg` call into
+/// a `usize`, failing if the type does not fit.
+fn human_readable_to_usize(
+    arg_name: &str,
+    value: Option<u64>,
+) -> Result<Option<usize>> {
+    use std::usize;
+
+    match value {
+        None => Ok(None),
+        Some(v) => {
+            if v <= usize::MAX as u64 {
+                Ok(Some(v as usize))
+            } else {
+                let msg = format!("number too large for {}", arg_name);
+                Err(From::from(msg))
+            }
+        }
+    }
+}
+
+/// Returns true if and only if stdin is deemed searchable.
+#[cfg(unix)]
+fn stdin_is_readable() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    use same_file::Handle;
+
+    let ft = match Handle::stdin().and_then(|h| h.as_file().metadata()) {
+        Err(_) => return false,
+        Ok(md) => md.file_type(),
+    };
+    ft.is_file() || ft.is_fifo()
+}
+
+/// Returns true if and only if stdin is deemed searchable.
+#[cfg(windows)]
+fn stdin_is_readable() -> bool {
+    // On Windows, it's not clear what the possibilities are to me, so just
+    // always return true.
+    true
 }

@@ -107,8 +107,8 @@ sherlock!(columns, |wd: WorkDir, mut cmd: Command| {
     cmd.arg("--column");
     let lines: String = wd.stdout(&mut cmd);
     let expected = "\
-57:For the Doctor Watsons of this world, as opposed to the Sherlock
-49:be, to a very large extent, the result of luck. Sherlock Holmes
+1:57:For the Doctor Watsons of this world, as opposed to the Sherlock
+3:49:be, to a very large extent, the result of luck. Sherlock Holmes
 ";
     assert_eq!(lines, expected);
 });
@@ -205,6 +205,16 @@ sherlock!(word, "as", |wd: WorkDir, mut cmd: Command| {
     let lines: String = wd.stdout(&mut cmd);
     let expected = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(line, "Watson|and exhibited clearly, with a label attached.",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-x");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+and exhibited clearly, with a label attached.
 ";
     assert_eq!(lines, expected);
 });
@@ -308,6 +318,17 @@ sherlock!(file_type_add, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
     assert_eq!(lines, "file.wat:Sherlock\n");
 });
 
+sherlock!(file_type_add_compose, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("file.py", "Sherlock");
+    wd.create("file.rs", "Sherlock");
+    wd.create("file.wat", "Sherlock");
+    cmd.arg("--type-add").arg("wat:*.wat");
+    cmd.arg("--type-add").arg("combo:include:wat,py").arg("-t").arg("combo");
+    let lines: String = wd.stdout(&mut cmd);
+    println!("{}", lines);
+    assert_eq!(sort_lines(&lines), "file.py:Sherlock\nfile.wat:Sherlock\n");
+});
+
 sherlock!(glob, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
     wd.create("file.py", "Sherlock");
     wd.create("file.rs", "Sherlock");
@@ -323,6 +344,21 @@ sherlock!(glob_negate, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
     cmd.arg("-g").arg("!*.rs");
     let lines: String = wd.stdout(&mut cmd);
     assert_eq!(lines, "file.py:Sherlock\n");
+});
+
+sherlock!(iglob, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("file.HTML", "Sherlock");
+    cmd.arg("--iglob").arg("*.html");
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "file.HTML:Sherlock\n");
+});
+
+sherlock!(csglob, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("file1.HTML", "Sherlock");
+    wd.create("file2.html", "Sherlock");
+    cmd.arg("--glob").arg("*.html");
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "file2.html:Sherlock\n");
 });
 
 sherlock!(count, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
@@ -419,6 +455,70 @@ sherlock!(context_line_numbers, "world|attached",
 6:and exhibited clearly, with a label attached.
 ";
     assert_eq!(lines, expected);
+});
+
+sherlock!(max_filesize_parse_error_length, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--max-filesize").arg("44444444444444444444");
+    wd.assert_err(&mut cmd);
+});
+
+sherlock!(max_filesize_parse_error_suffix, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--max-filesize").arg("45k");
+    wd.assert_err(&mut cmd);
+});
+
+sherlock!(max_filesize_parse_no_suffix, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.remove("sherlock");
+    wd.create_size("foo", 40);
+    wd.create_size("bar", 60);
+
+    cmd.arg("--max-filesize").arg("50").arg("--files");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+foo
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(max_filesize_parse_k_suffix, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.remove("sherlock");
+    wd.create_size("foo", 3048);
+    wd.create_size("bar", 4100);
+
+    cmd.arg("--max-filesize").arg("4K").arg("--files");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+foo
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(max_filesize_parse_m_suffix, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.remove("sherlock");
+    wd.create_size("foo", 1000000);
+    wd.create_size("bar", 1400000);
+
+    cmd.arg("--max-filesize").arg("1M").arg("--files");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+foo
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(max_filesize_suffix_overflow, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.remove("sherlock");
+    wd.create_size("foo", 1000000);
+
+    // 2^35 * 2^30 would otherwise overflow
+    cmd.arg("--max-filesize").arg("34359738368G").arg("--files");
+    wd.assert_err(&mut cmd);
 });
 
 sherlock!(ignore_hidden, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
@@ -770,7 +870,7 @@ clean!(regression_105_part2, "test", ".", |wd: WorkDir, mut cmd: Command| {
     cmd.arg("--column");
 
     let lines: String = wd.stdout(&mut cmd);
-    assert_eq!(lines, "foo:3:zztest\n");
+    assert_eq!(lines, "foo:1:3:zztest\n");
 });
 
 // See: https://github.com/BurntSushi/ripgrep/issues/127
@@ -977,6 +1077,119 @@ clean!(regression_279, "test", ".", |wd: WorkDir, mut cmd: Command| {
     assert_eq!(lines, "");
 });
 
+// See: https://github.com/BurntSushi/ripgrep/issues/405
+clean!(regression_405, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create_dir("foo/bar");
+    wd.create_dir("bar/foo");
+    wd.create("foo/bar/file1.txt", "test");
+    wd.create("bar/foo/file2.txt", "test");
+    cmd.arg("-g").arg("!/foo/**");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, format!("{}:test\n", path("bar/foo/file2.txt")));
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/428
+#[cfg(not(windows))]
+clean!(regression_428_color_context_path, "foo", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.create("sherlock", "foo\nbar");
+    cmd.arg("-A1").arg("-H").arg("--no-heading").arg("-N")
+       .arg("--colors=match:none").arg("--color=always");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = format!(
+        "{colored_path}:foo\n{colored_path}-bar\n",
+        colored_path=format!(
+            "\x1b\x5b\x6d\x1b\x5b\x33\x35\x6d{path}\x1b\x5b\x6d",
+            path=path("sherlock")));
+    assert_eq!(lines, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/428
+clean!(regression_428_unrecognized_style, "Sherlok", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--colors=match:style:");
+    wd.assert_err(&mut cmd);
+
+    let output = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    let expected = "\
+Unrecognized style attribute ''. Choose from: nobold, bold, nointense, intense.
+";
+    assert_eq!(err, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/493
+clean!(regression_493, " 're ", "input.txt", |wd: WorkDir, mut cmd: Command| {
+    wd.create("input.txt", "peshwaship 're seminomata");
+    cmd.arg("-o").arg("-w");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, " 're \n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1
+clean!(feature_1_sjis, "Шерлок Холмс", ".", |wd: WorkDir, mut cmd: Command| {
+    let sherlock =
+        b"\x84Y\x84u\x84\x82\x84|\x84\x80\x84{ \x84V\x84\x80\x84|\x84}\x84\x83";
+    wd.create_bytes("foo", &sherlock[..]);
+    cmd.arg("-Esjis");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo:Шерлок Холмс\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1
+clean!(feature_1_utf16_auto, "Шерлок Холмс", ".",
+|wd: WorkDir, mut cmd: Command| {
+    let sherlock =
+        b"\xff\xfe(\x045\x04@\x04;\x04>\x04:\x04 \x00%\x04>\x04;\x04<\x04A\x04";
+    wd.create_bytes("foo", &sherlock[..]);
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo:Шерлок Холмс\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1
+clean!(feature_1_utf16_explicit, "Шерлок Холмс", ".",
+|wd: WorkDir, mut cmd: Command| {
+    let sherlock =
+        b"\xff\xfe(\x045\x04@\x04;\x04>\x04:\x04 \x00%\x04>\x04;\x04<\x04A\x04";
+    wd.create_bytes("foo", &sherlock[..]);
+    cmd.arg("-Eutf-16le");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo:Шерлок Холмс\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1
+clean!(feature_1_eucjp, "Шерлок Холмс", ".",
+|wd: WorkDir, mut cmd: Command| {
+    let sherlock =
+        b"\xa7\xba\xa7\xd6\xa7\xe2\xa7\xdd\xa7\xe0\xa7\xdc \xa7\xb7\xa7\xe0\xa7\xdd\xa7\xde\xa7\xe3";
+    wd.create_bytes("foo", &sherlock[..]);
+    cmd.arg("-Eeuc-jp");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo:Шерлок Холмс\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1
+sherlock!(feature_1_unknown_encoding, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-Efoobar");
+    wd.assert_non_empty_stderr(&mut cmd);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1
+// Specific: https://github.com/BurntSushi/ripgrep/pull/398/files#r111109265
+sherlock!(feature_1_replacement_encoding, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-Ecsiso2022kr");
+    wd.assert_non_empty_stderr(&mut cmd);
+});
+
 // See: https://github.com/BurntSushi/ripgrep/issues/7
 sherlock!(feature_7, "-fpat", "sherlock", |wd: WorkDir, mut cmd: Command| {
     wd.create("pat", "Sherlock\nHolmes");
@@ -1009,6 +1222,32 @@ sherlock!(feature_20_no_filename, "Sherlock", ".",
     let expected = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
 be, to a very large extent, the result of luck. Sherlock Holmes
+";
+    assert_eq!(lines, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/34
+sherlock!(feature_34_only_matching, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--only-matching");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+sherlock:Sherlock
+sherlock:Sherlock
+";
+    assert_eq!(lines, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/34
+sherlock!(feature_34_only_matching_line_column, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--only-matching").arg("--column").arg("--line-number");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+sherlock:1:57:Sherlock
+sherlock:3:49:Sherlock
 ";
     assert_eq!(lines, expected);
 });
@@ -1188,6 +1427,36 @@ clean!(feature_109_case_sensitive_part2, "test", ".",
     wd.assert_err(&mut cmd);
 });
 
+// See: https://github.com/BurntSushi/ripgrep/issues/129
+clean!(feature_129_matches, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("foo", "test\ntest abcdefghijklmnopqrstuvwxyz test");
+    cmd.arg("-M26");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "foo:test\nfoo:[Omitted long line with 2 matches]\n";
+    assert_eq!(lines, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/129
+clean!(feature_129_context, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("foo", "test\nabcdefghijklmnopqrstuvwxyz");
+    cmd.arg("-M20").arg("-C1");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "foo:test\nfoo-[Omitted long context line]\n";
+    assert_eq!(lines, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/129
+clean!(feature_129_replace, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("foo", "test\ntest abcdefghijklmnopqrstuvwxyz test");
+    cmd.arg("-M26").arg("-rfoo");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "foo:foo\nfoo:[Omitted long line with 2 replacements]\n";
+    assert_eq!(lines, expected);
+});
+
 // See: https://github.com/BurntSushi/ripgrep/issues/159
 clean!(feature_159_works, "test", ".", |wd: WorkDir, mut cmd: Command| {
     wd.create("foo", "test\ntest");
@@ -1201,6 +1470,77 @@ clean!(feature_159_zero_max, "test", ".", |wd: WorkDir, mut cmd: Command| {
     wd.create("foo", "test\ntest");
     cmd.arg("-m0");
     wd.assert_err(&mut cmd);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/243
+clean!(feature_243_column_line, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("foo", "test");
+    cmd.arg("--column");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo:1:1:test\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/263
+clean!(feature_263_sort_files, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("foo", "test");
+    wd.create("abc", "test");
+    wd.create("zoo", "test");
+    wd.create("bar", "test");
+    cmd.arg("--sort-files");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "abc:test\nbar:test\nfoo:test\nzoo:test\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/275
+clean!(feature_275_pathsep, "test", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create_dir("foo");
+    wd.create("foo/bar", "test");
+    cmd.arg("--path-separator").arg("Z");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "fooZbar:test\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/362
+sherlock!(feature_362_dfa_size_limit, r"For\s",
+|wd: WorkDir, mut cmd: Command| {
+    // This should fall back to the nfa engine but should still produce the
+    // expected result.
+    cmd.arg("--dfa-size-limit").arg("10");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(feature_362_exceeds_regex_size_limit, r"[0-9]\w+",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--regex-size-limit").arg("10K");
+    wd.assert_err(&mut cmd);
+});
+
+#[cfg(target_pointer_width = "32")]
+sherlock!(feature_362_u64_to_narrow_usize_suffix_overflow, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.remove("sherlock");
+    wd.create_size("foo", 1000000);
+
+    // 2^35 * 2^20 is ok for u64, but not for usize
+    cmd.arg("--dfa-size-limit").arg("34359738368M").arg("--files");
+    wd.assert_err(&mut cmd);
+});
+
+
+// See: https://github.com/BurntSushi/ripgrep/issues/419
+sherlock!(feature_419_zero_as_shortcut_for_null, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-0").arg("--count");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "sherlock\x002\n");
 });
 
 #[test]
@@ -1282,6 +1622,141 @@ fn regression_270() {
     cmd.arg("-e").arg("-test");
     let lines: String = wd.stdout(&mut cmd);
     assert_eq!(lines, path("foo:-test\n"));
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/391
+#[test]
+fn regression_391() {
+    let wd = WorkDir::new("regression_391");
+    wd.create_dir(".git");
+    wd.create("lock", "");
+    wd.create("bar.py", "");
+    wd.create(".git/packed-refs", "");
+    wd.create(".git/description", "");
+
+    let mut cmd = wd.command();
+    cmd.arg("--no-ignore").arg("--hidden").arg("--follow").arg("--files")
+        .arg("--glob")
+        .arg("!{.git,node_modules,plugged}/**")
+        .arg("--glob")
+        .arg("*.{js,json,php,md,styl,scss,sass,pug,html,config,py,cpp,c,go,hs}");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "bar.py\n");
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/451
+#[test]
+fn regression_451_only_matching_as_in_issue() {
+    let wd = WorkDir::new("regression_451_only_matching");
+    let path = "digits.txt";
+    wd.create(path, "1 2 3\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("[0-9]+").arg(path).arg("--only-matching");
+    let lines: String = wd.stdout(&mut cmd);
+
+    let expected = "\
+1
+2
+3
+";
+
+    assert_eq!(lines, expected);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/451
+#[test]
+fn regression_451_only_matching() {
+    let wd = WorkDir::new("regression_451_only_matching");
+    let path = "digits.txt";
+    wd.create(path, "1 2 3\n123\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("[0-9]").arg(path)
+        .arg("--only-matching")
+        .arg("--column");
+    let lines: String = wd.stdout(&mut cmd);
+
+    let expected = "\
+1:1:1
+1:3:2
+1:5:3
+2:1:1
+2:2:2
+2:3:3
+";
+
+    assert_eq!(lines, expected);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/483
+#[test]
+fn regression_483_matching_no_stdout() {
+    let wd = WorkDir::new("regression_483_matching_no_stdout");
+    wd.create("file.py", "");
+
+    let mut cmd = wd.command();
+    cmd.arg("--quiet")
+       .arg("--files")
+       .arg("--glob").arg("*.py");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert!(lines.is_empty());
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/483
+#[test]
+fn regression_483_non_matching_exit_code() {
+    let wd = WorkDir::new("regression_483_non_matching_exit_code");
+    wd.create("file.rs", "");
+
+    let mut cmd = wd.command();
+    cmd.arg("--quiet")
+       .arg("--files")
+       .arg("--glob").arg("*.py");
+
+    wd.assert_err(&mut cmd);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/506
+#[test]
+fn regression_506_word_boundaries_not_parenthesized() {
+    let wd = WorkDir::new("regression_506_word_boundaries_not_parenthesized");
+    let path = "wb.txt";
+    wd.create(path, "min minimum amin\n\
+              max maximum amax");
+
+    let mut cmd = wd.command();
+    cmd.arg("-w").arg("min|max").arg(path).arg("--only-matching");
+    let lines: String = wd.stdout(&mut cmd);
+
+    let expected = "min\nmax\n";
+
+    assert_eq!(lines, expected);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/568
+#[test]
+fn regression_568_leading_hyphen_option_arguments() {
+    let wd = WorkDir::new("regression_568_leading_hyphen_option_arguments");
+    let path = "file";
+    wd.create(path, "foo bar -baz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-e-baz").arg("-e").arg("-baz").arg(path);
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo bar -baz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-rni").arg("bar").arg(path);
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo ni -baz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-r").arg("-n").arg("-i").arg("bar").arg(path);
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo -n -baz\n");
 }
 
 #[test]

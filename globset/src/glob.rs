@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::hash;
 use std::iter;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, is_separator};
@@ -8,7 +9,7 @@ use std::str;
 use regex;
 use regex::bytes::Regex;
 
-use {Candidate, Error, new_regex};
+use {Candidate, Error, ErrorKind, new_regex};
 
 /// Describes a matching strategy for a particular pattern.
 ///
@@ -76,12 +77,25 @@ impl MatchStrategy {
 ///
 /// It cannot be used directly to match file paths, but it can be converted
 /// to a regular expression string or a matcher.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq)]
 pub struct Glob {
     glob: String,
     re: String,
     opts: GlobOptions,
     tokens: Tokens,
+}
+
+impl PartialEq for Glob {
+  fn eq(&self, other: &Glob) -> bool {
+    self.glob == other.glob && self.opts == other.opts
+  }
+}
+
+impl hash::Hash for Glob {
+  fn hash<H: hash::Hasher>(&self, state: &mut H) {
+    self.glob.hash(state);
+    self.opts.hash(state);
+  }
 }
 
 impl fmt::Display for Glob {
@@ -173,7 +187,7 @@ pub struct GlobBuilder<'a> {
     opts: GlobOptions,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 struct GlobOptions {
     /// Whether to match case insensitively.
     case_insensitive: bool,
@@ -530,6 +544,7 @@ impl<'a> GlobBuilder<'a> {
     /// Parses and builds the pattern.
     pub fn build(&self) -> Result<Glob, Error> {
         let mut p = Parser {
+            glob: &self.glob,
             stack: vec![Tokens::default()],
             chars: self.glob.chars().peekable(),
             prev: None,
@@ -537,9 +552,15 @@ impl<'a> GlobBuilder<'a> {
         };
         try!(p.parse());
         if p.stack.is_empty() {
-            Err(Error::UnopenedAlternates)
+            Err(Error {
+                glob: Some(self.glob.to_string()),
+                kind: ErrorKind::UnopenedAlternates,
+            })
         } else if p.stack.len() > 1 {
-            Err(Error::UnclosedAlternates)
+            Err(Error {
+                glob: Some(self.glob.to_string()),
+                kind: ErrorKind::UnclosedAlternates,
+            })
         } else {
             let tokens = p.stack.pop().unwrap();
             Ok(Glob {
@@ -645,9 +666,18 @@ impl Tokens {
                     for pat in patterns {
                         let mut altre = String::new();
                         self.tokens_to_regex(options, &pat, &mut altre);
-                        parts.push(altre);
+                        if !altre.is_empty() {
+                            parts.push(altre);
+                        }
                     }
-                    re.push_str(&parts.join("|"));
+
+                    // It is possible to have an empty set in which case the
+                    // resulting alternation '()' would be an error.
+                    if !parts.is_empty() {
+                        re.push('(');
+                        re.push_str(&parts.join("|"));
+                        re.push(')');
+                    }
                 }
             }
         }
@@ -666,7 +696,7 @@ fn bytes_to_escaped_literal(bs: &[u8]) -> String {
     let mut s = String::with_capacity(bs.len());
     for &b in bs {
         if b <= 0x7F {
-            s.push_str(&regex::quote(&(b as char).to_string()));
+            s.push_str(&regex::escape(&(b as char).to_string()));
         } else {
             s.push_str(&format!("\\x{:02x}", b));
         }
@@ -675,6 +705,7 @@ fn bytes_to_escaped_literal(bs: &[u8]) -> String {
 }
 
 struct Parser<'a> {
+    glob: &'a str,
     stack: Vec<Tokens>,
     chars: iter::Peekable<str::Chars<'a>>,
     prev: Option<char>,
@@ -682,6 +713,10 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    fn error(&self, kind: ErrorKind) -> Error {
+        Error { glob: Some(self.glob.to_string()), kind: kind }
+    }
+
     fn parse(&mut self) -> Result<(), Error> {
         while let Some(c) = self.bump() {
             match c {
@@ -706,7 +741,7 @@ impl<'a> Parser<'a> {
 
     fn push_alternate(&mut self) -> Result<(), Error> {
         if self.stack.len() > 1 {
-            return Err(Error::NestedAlternates);
+            return Err(self.error(ErrorKind::NestedAlternates));
         }
         Ok(self.stack.push(Tokens::default()))
     }
@@ -720,22 +755,22 @@ impl<'a> Parser<'a> {
     }
 
     fn push_token(&mut self, tok: Token) -> Result<(), Error> {
-        match self.stack.last_mut() {
-            None => Err(Error::UnopenedAlternates),
-            Some(ref mut pat) => Ok(pat.push(tok)),
+        if let Some(ref mut pat) = self.stack.last_mut() {
+            return Ok(pat.push(tok));
         }
+        Err(self.error(ErrorKind::UnopenedAlternates))
     }
 
     fn pop_token(&mut self) -> Result<Token, Error> {
-        match self.stack.last_mut() {
-            None => Err(Error::UnopenedAlternates),
-            Some(ref mut pat) => Ok(pat.pop().unwrap()),
+        if let Some(ref mut pat) = self.stack.last_mut() {
+            return Ok(pat.pop().unwrap());
         }
+        Err(self.error(ErrorKind::UnopenedAlternates))
     }
 
     fn have_tokens(&self) -> Result<bool, Error> {
         match self.stack.last() {
-            None => Err(Error::UnopenedAlternates),
+            None => Err(self.error(ErrorKind::UnopenedAlternates)),
             Some(ref pat) => Ok(!pat.is_empty()),
         }
     }
@@ -762,7 +797,7 @@ impl<'a> Parser<'a> {
             try!(self.push_token(Token::RecursivePrefix));
             let next = self.bump();
             if !next.map(is_separator).unwrap_or(true) {
-                return Err(Error::InvalidRecursive);
+                return Err(self.error(ErrorKind::InvalidRecursive));
             }
             return Ok(());
         }
@@ -770,7 +805,7 @@ impl<'a> Parser<'a> {
         if !prev.map(is_separator).unwrap_or(false) {
             if self.stack.len() <= 1
                 || (prev != Some(',') && prev != Some('{')) {
-                return Err(Error::InvalidRecursive);
+                return Err(self.error(ErrorKind::InvalidRecursive));
             }
         }
         match self.chars.peek() {
@@ -785,18 +820,22 @@ impl<'a> Parser<'a> {
                 assert!(self.bump().map(is_separator).unwrap_or(false));
                 self.push_token(Token::RecursiveZeroOrMore)
             }
-            _ => Err(Error::InvalidRecursive),
+            _ => Err(self.error(ErrorKind::InvalidRecursive)),
         }
     }
 
     fn parse_class(&mut self) -> Result<(), Error> {
         fn add_to_last_range(
+            glob: &str,
             r: &mut (char, char),
             add: char,
         ) -> Result<(), Error> {
             r.1 = add;
             if r.1 < r.0 {
-                Err(Error::InvalidRange(r.0, r.1))
+                Err(Error {
+                    glob: Some(glob.to_string()),
+                    kind: ErrorKind::InvalidRange(r.0, r.1),
+                })
             } else {
                 Ok(())
             }
@@ -814,7 +853,7 @@ impl<'a> Parser<'a> {
                 Some(c) => c,
                 // The only way to successfully break this loop is to observe
                 // a ']'.
-                None => return Err(Error::UnclosedClass),
+                None => return Err(self.error(ErrorKind::UnclosedClass)),
             };
             match c {
                 ']' => {
@@ -831,7 +870,7 @@ impl<'a> Parser<'a> {
                         // invariant: in_range is only set when there is
                         // already at least one character seen.
                         let r = ranges.last_mut().unwrap();
-                        try!(add_to_last_range(r, '-'));
+                        try!(add_to_last_range(&self.glob, r, '-'));
                         in_range = false;
                     } else {
                         assert!(!ranges.is_empty());
@@ -842,7 +881,8 @@ impl<'a> Parser<'a> {
                     if in_range {
                         // invariant: in_range is only set when there is
                         // already at least one character seen.
-                        try!(add_to_last_range(ranges.last_mut().unwrap(), c));
+                        try!(add_to_last_range(
+                            &self.glob, ranges.last_mut().unwrap(), c));
                     } else {
                         ranges.push((c, c));
                     }
@@ -886,7 +926,7 @@ fn ends_with(needle: &[u8], haystack: &[u8]) -> bool {
 mod tests {
     use std::ffi::{OsStr, OsString};
 
-    use {GlobSetBuilder, Error};
+    use {GlobSetBuilder, ErrorKind};
     use super::{Glob, GlobBuilder, Token};
     use super::Token::*;
 
@@ -911,7 +951,7 @@ mod tests {
             #[test]
             fn $name() {
                 let err = Glob::new($pat).unwrap_err();
-                assert_eq!($err, err);
+                assert_eq!(&$err, err.kind());
             }
         }
     }
@@ -1034,19 +1074,19 @@ mod tests {
     syntax!(cls18, "[!0-9a-z]", vec![rclassn(&[('0', '9'), ('a', 'z')])]);
     syntax!(cls19, "[!a-z0-9]", vec![rclassn(&[('a', 'z'), ('0', '9')])]);
 
-    syntaxerr!(err_rseq1, "a**", Error::InvalidRecursive);
-    syntaxerr!(err_rseq2, "**a", Error::InvalidRecursive);
-    syntaxerr!(err_rseq3, "a**b", Error::InvalidRecursive);
-    syntaxerr!(err_rseq4, "***", Error::InvalidRecursive);
-    syntaxerr!(err_rseq5, "/a**", Error::InvalidRecursive);
-    syntaxerr!(err_rseq6, "/**a", Error::InvalidRecursive);
-    syntaxerr!(err_rseq7, "/a**b", Error::InvalidRecursive);
-    syntaxerr!(err_unclosed1, "[", Error::UnclosedClass);
-    syntaxerr!(err_unclosed2, "[]", Error::UnclosedClass);
-    syntaxerr!(err_unclosed3, "[!", Error::UnclosedClass);
-    syntaxerr!(err_unclosed4, "[!]", Error::UnclosedClass);
-    syntaxerr!(err_range1, "[z-a]", Error::InvalidRange('z', 'a'));
-    syntaxerr!(err_range2, "[z--]", Error::InvalidRange('z', '-'));
+    syntaxerr!(err_rseq1, "a**", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_rseq2, "**a", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_rseq3, "a**b", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_rseq4, "***", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_rseq5, "/a**", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_rseq6, "/**a", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_rseq7, "/a**b", ErrorKind::InvalidRecursive);
+    syntaxerr!(err_unclosed1, "[", ErrorKind::UnclosedClass);
+    syntaxerr!(err_unclosed2, "[]", ErrorKind::UnclosedClass);
+    syntaxerr!(err_unclosed3, "[!", ErrorKind::UnclosedClass);
+    syntaxerr!(err_unclosed4, "[!]", ErrorKind::UnclosedClass);
+    syntaxerr!(err_range1, "[z-a]", ErrorKind::InvalidRange('z', 'a'));
+    syntaxerr!(err_range2, "[z--]", ErrorKind::InvalidRange('z', '-'));
 
     const CASEI: Options = Options {
         casei: true,

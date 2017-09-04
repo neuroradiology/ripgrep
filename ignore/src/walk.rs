@@ -1,4 +1,5 @@
-use std::ffi::OsStr;
+use std::cmp;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, FileType, Metadata};
 use std::io;
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 use std::vec;
 
 use crossbeam::sync::MsQueue;
@@ -68,6 +70,14 @@ impl DirEntry {
     /// Returns the depth at which this entry was created relative to the root.
     pub fn depth(&self) -> usize {
         self.dent.depth()
+    }
+
+    /// Returns the underlying inode number if one exists.
+    ///
+    /// If this entry doesn't have an inode number, then `None` is returned.
+    #[cfg(unix)]
+    pub fn ino(&self) -> Option<u64> {
+        self.dent.ino()
     }
 
     /// Returns an error, if one exists, associated with processing this entry.
@@ -186,6 +196,16 @@ impl DirEntryInner {
             Raw(ref x) => x.depth(),
         }
     }
+
+    #[cfg(unix)]
+    fn ino(&self) -> Option<u64> {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => None,
+            Walkdir(ref x) => Some(x.ino()),
+            Raw(ref x) => Some(x.ino()),
+        }
+    }
 }
 
 /// DirEntryRaw is essentially copied from the walkdir crate so that we can
@@ -201,6 +221,9 @@ struct DirEntryRaw {
     follow_link: bool,
     /// The depth at which this entry was generated relative to the root.
     depth: usize,
+    /// The underlying inode number (Unix only).
+    #[cfg(unix)]
+    ino: u64,
 }
 
 impl fmt::Debug for DirEntryRaw {
@@ -245,6 +268,11 @@ impl DirEntryRaw {
         self.depth
     }
 
+    #[cfg(unix)]
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn from_entry(
         depth: usize,
         ent: &fs::DirEntry,
@@ -256,14 +284,41 @@ impl DirEntryRaw {
                 err: Box::new(err),
             }
         }));
-        Ok(DirEntryRaw {
+        Ok(DirEntryRaw::from_entry_os(depth, ent, ty))
+    }
+
+    #[cfg(not(unix))]
+    fn from_entry_os(
+        depth: usize,
+        ent: &fs::DirEntry,
+        ty: fs::FileType,
+    ) -> DirEntryRaw {
+        DirEntryRaw {
             path: ent.path(),
             ty: ty,
             follow_link: false,
             depth: depth,
-        })
+        }
     }
 
+    #[cfg(unix)]
+    fn from_entry_os(
+        depth: usize,
+        ent: &fs::DirEntry,
+        ty: fs::FileType,
+    ) -> DirEntryRaw {
+        use std::os::unix::fs::DirEntryExt;
+
+        DirEntryRaw {
+            path: ent.path(),
+            ty: ty,
+            follow_link: false,
+            depth: depth,
+            ino: ent.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
     fn from_link(depth: usize, pb: PathBuf) -> Result<DirEntryRaw, Error> {
         let md = try!(fs::metadata(&pb).map_err(|err| {
             Error::Io(err).with_path(&pb)
@@ -273,6 +328,22 @@ impl DirEntryRaw {
             ty: md.file_type(),
             follow_link: true,
             depth: depth,
+        })
+    }
+
+    #[cfg(unix)]
+    fn from_link(depth: usize, pb: PathBuf) -> Result<DirEntryRaw, Error> {
+        use std::os::unix::fs::MetadataExt;
+
+        let md = try!(fs::metadata(&pb).map_err(|err| {
+            Error::Io(err).with_path(&pb)
+        }));
+        Ok(DirEntryRaw {
+            path: pb,
+            ty: md.file_type(),
+            follow_link: true,
+            depth: depth,
+            ino: md.ino(),
         })
     }
 }
@@ -309,28 +380,46 @@ impl DirEntryRaw {
 /// is: `.ignore`, `.gitignore`, `.git/info/exclude`, global gitignore and
 /// finally explicitly added ignore files. Note that precedence between
 /// different types of ignore files is not impacted by the directory hierarchy;
-/// any `.ignore` file overrides all `.gitignore` files. Within each
-/// precedence level, more nested ignore files have a higher precedence over
-/// less nested ignore files.
-/// * Third, if the previous step yields an ignore match, than all matching
-/// is stopped and the path is skipped.. If it yields a whitelist match, then
-/// process continues. A whitelist match can be overridden by a later matcher.
+/// any `.ignore` file overrides all `.gitignore` files. Within each precedence
+/// level, more nested ignore files have a higher precedence than less nested
+/// ignore files.
+/// * Third, if the previous step yields an ignore match, then all matching
+/// is stopped and the path is skipped. If it yields a whitelist match, then
+/// matching continues. A whitelist match can be overridden by a later matcher.
 /// * Fourth, unless the path is a directory, the file type matcher is run on
-/// the path. As above, if it's an ignore match, then all matching is stopped
-/// and the path is skipped. If it's a whitelist match, then matching
-/// continues.
+/// the path. As above, if it yields an ignore match, then all matching is
+/// stopped and the path is skipped. If it yields a whitelist match, then
+/// matching continues.
 /// * Fifth, if the path hasn't been whitelisted and it is hidden, then the
 /// path is skipped.
-/// * Sixth, if the path has made it this far then it is yielded in the
+/// * Sixth, unless the path is a directory, the size of the file is compared
+/// against the max filesize limit. If it exceeds the limit, it is skipped.
+/// * Seventh, if the path has made it this far then it is yielded in the
 /// iterator.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WalkBuilder {
     paths: Vec<PathBuf>,
     ig_builder: IgnoreBuilder,
     parents: bool,
     max_depth: Option<usize>,
+    max_filesize: Option<u64>,
     follow_links: bool,
+    sorter: Option<Arc<Fn(&OsString, &OsString) -> cmp::Ordering + 'static>>,
     threads: usize,
+}
+
+impl fmt::Debug for WalkBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("WalkBuilder")
+            .field("paths", &self.paths)
+            .field("ig_builder", &self.ig_builder)
+            .field("parents", &self.parents)
+            .field("max_depth", &self.max_depth)
+            .field("max_filesize", &self.max_filesize)
+            .field("follow_links", &self.follow_links)
+            .field("threads", &self.threads)
+            .finish()
+    }
 }
 
 impl WalkBuilder {
@@ -346,7 +435,9 @@ impl WalkBuilder {
             ig_builder: IgnoreBuilder::new(),
             parents: true,
             max_depth: None,
+            max_filesize: None,
             follow_links: false,
+            sorter: None,
             threads: 0,
         }
     }
@@ -355,6 +446,7 @@ impl WalkBuilder {
     pub fn build(&self) -> Walk {
         let follow_links = self.follow_links;
         let max_depth = self.max_depth;
+        let cmp = self.sorter.clone();
         let its = self.paths.iter().map(move |p| {
             if p == Path::new("-") {
                 (p.to_path_buf(), None)
@@ -363,6 +455,10 @@ impl WalkBuilder {
                 wd = wd.follow_links(follow_links || p.is_file());
                 if let Some(max_depth) = max_depth {
                     wd = wd.max_depth(max_depth);
+                }
+                if let Some(ref cmp) = cmp {
+                    let cmp = cmp.clone();
+                    wd = wd.sort_by(move |a, b| cmp(a, b));
                 }
                 (p.to_path_buf(), Some(WalkEventIter::from(wd)))
             }
@@ -373,6 +469,7 @@ impl WalkBuilder {
             it: None,
             ig_root: ig_root.clone(),
             ig: ig_root.clone(),
+            max_filesize: self.max_filesize,
             parents: self.parents,
         }
     }
@@ -387,6 +484,7 @@ impl WalkBuilder {
             paths: self.paths.clone().into_iter(),
             ig_root: self.ig_builder.build(),
             max_depth: self.max_depth,
+            max_filesize: self.max_filesize,
             follow_links: self.follow_links,
             parents: self.parents,
             threads: self.threads,
@@ -414,6 +512,12 @@ impl WalkBuilder {
     /// Whether to follow symbolic links or not.
     pub fn follow_links(&mut self, yes: bool) -> &mut WalkBuilder {
         self.follow_links = yes;
+        self
+    }
+
+    /// Whether to ignore files above the specified limit.
+    pub fn max_filesize(&mut self, filesize: Option<u64>) -> &mut WalkBuilder {
+        self.max_filesize = filesize;
         self
     }
 
@@ -467,6 +571,29 @@ impl WalkBuilder {
         self
     }
 
+    /// Enables all the standard ignore filters.
+    /// 
+    /// This toggles, as a group, all the filters that are enabled by default:
+    /// 
+    /// - [hidden()](#method.hidden)
+    /// - [parents()](#method.parents)
+    /// - [ignore()](#method.ignore)
+    /// - [git_ignore()](#method.git_ignore)
+    /// - [git_global()](#method.git_global)
+    /// - [git_exclude()](#method.git_exclude)
+    /// 
+    /// They may still be toggled individually after calling this function.
+    ///
+    /// This is (by definition) enabled by default.
+    pub fn standard_filters(&mut self, yes: bool) -> &mut WalkBuilder {
+        self.hidden(yes)
+            .parents(yes)
+            .ignore(yes)
+            .git_ignore(yes)
+            .git_global(yes)
+            .git_exclude(yes)
+    }
+
     /// Enables ignoring hidden files.
     ///
     /// This is enabled by default.
@@ -506,6 +633,8 @@ impl WalkBuilder {
     /// does not exist or does not specify `core.excludesFile`, then
     /// `$XDG_CONFIG_HOME/git/ignore` is read. If `$XDG_CONFIG_HOME` is not
     /// set or is empty, then `$HOME/.config/git/ignore` is used instead.
+    ///
+    /// This is enabled by default.
     pub fn git_global(&mut self, yes: bool) -> &mut WalkBuilder {
         self.ig_builder.git_global(yes);
         self
@@ -532,6 +661,20 @@ impl WalkBuilder {
         self.ig_builder.git_exclude(yes);
         self
     }
+
+    /// Set a function for sorting directory entries.
+    ///
+    /// If a compare function is set, the resulting iterator will return all
+    /// paths in sorted order. The compare function will be called to compare
+    /// names from entries from the same directory using only the name of the
+    /// entry.
+    ///
+    /// Note that this is not used in the parallel iterator.
+    pub fn sort_by<F>(&mut self, cmp: F) -> &mut WalkBuilder
+            where F: Fn(&OsString, &OsString) -> cmp::Ordering + 'static {
+        self.sorter = Some(Arc::new(cmp));
+        self
+    }
 }
 
 /// Walk is a recursive directory iterator over file paths in one or more
@@ -545,6 +688,7 @@ pub struct Walk {
     it: Option<WalkEventIter>,
     ig_root: Ignore,
     ig: Ignore,
+    max_filesize: Option<u64>,
     parents: bool,
 }
 
@@ -562,7 +706,17 @@ impl Walk {
         if ent.depth() == 0 {
             return false;
         }
-        skip_path(&self.ig, ent.path(), ent.file_type().is_dir())
+
+        let is_dir = ent.file_type().is_dir();
+        let max_size = self.max_filesize;
+        let should_skip_path = skip_path(&self.ig, ent.path(), is_dir);
+        let should_skip_filesize = if !is_dir && max_size.is_some() {
+            skip_filesize(max_size.unwrap(), ent.path(), &ent.metadata().ok())
+        } else {
+            false
+        };
+
+        should_skip_path || should_skip_filesize
     }
 }
 
@@ -719,6 +873,7 @@ pub struct WalkParallel {
     paths: vec::IntoIter<PathBuf>,
     ig_root: Ignore,
     parents: bool,
+    max_filesize: Option<u64>,
     max_depth: Option<usize>,
     follow_links: bool,
     threads: usize,
@@ -781,6 +936,7 @@ impl WalkParallel {
                 threads: threads,
                 parents: self.parents,
                 max_depth: self.max_depth,
+                max_filesize: self.max_filesize,
                 follow_links: self.follow_links,
             };
             handles.push(thread::spawn(|| worker.run()));
@@ -895,6 +1051,9 @@ struct Worker {
     /// The maximum depth of directories to descend. A value of `0` means no
     /// descension at all.
     max_depth: Option<usize>,
+    /// The maximum size a searched file can be (in bytes). If a file exceeds
+    /// this size it will be skipped.
+    max_filesize: Option<u64>,
     /// Whether to follow symbolic links or not. When this is enabled, loop
     /// detection is performed.
     follow_links: bool,
@@ -907,10 +1066,9 @@ impl Worker {
     /// skipped by the ignore matcher.
     fn run(mut self) {
         while let Some(mut work) = self.get_work() {
-            let depth = work.dent.depth();
-            // If this is an explicitly given path and is not a directory,
-            // then execute the caller's callback and move on.
-            if depth == 0 && !work.is_dir() {
+            // If the work is not a directory, then we can just execute the
+            // caller's callback immediately and move on.
+            if !work.is_dir() {
                 if (self.f)(Ok(work.dent)).is_quit() {
                     self.quit_now();
                     return;
@@ -935,6 +1093,7 @@ impl Worker {
                     continue;
                 }
             };
+            let depth = work.dent.depth();
             match (self.f)(Ok(work.dent)) {
                 WalkState::Continue => {}
                 WalkState::Skip => continue,
@@ -958,9 +1117,8 @@ impl Worker {
     /// Runs the worker on a single entry from a directory iterator.
     ///
     /// If the entry is a path that should be ignored, then this is a no-op.
-    /// Otherwise, if the entry is a directory, then it is pushed on to the
-    /// queue. If the entry isn't a directory, the caller's callback is
-    /// applied.
+    /// Otherwise, the entry is pushed on to the queue. (The actual execution
+    /// of the callback happens in `run`.)
     ///
     /// If an error occurs while reading the entry, then it is sent to the
     /// caller's callback.
@@ -1002,17 +1160,21 @@ impl Worker {
             }
         }
         let is_dir = dent.file_type().map_or(false, |ft| ft.is_dir());
-        if skip_path(ig, dent.path(), is_dir) {
-            WalkState::Continue
-        } else if !is_dir {
-            (self.f)(Ok(dent))
+        let max_size = self.max_filesize;
+        let should_skip_path = skip_path(ig, dent.path(), is_dir);
+        let should_skip_filesize = if !is_dir && max_size.is_some() {
+            skip_filesize(max_size.unwrap(), dent.path(), &dent.metadata().ok())
         } else {
+            false
+        };
+
+        if !should_skip_path && !should_skip_filesize {
             self.queue.push(Message::Work(Work {
                 dent: dent,
                 ignore: ig.clone(),
             }));
-            WalkState::Continue
         }
+        WalkState::Continue
     }
 
     /// Returns the next directory to descend into.
@@ -1060,8 +1222,6 @@ impl Worker {
                         }
                         // Otherwise, spin.
                     }
-                    // If we're here, then we've aborted our quit attempt.
-                    continue;
                 }
                 None => {
                     self.waiting(true);
@@ -1070,8 +1230,16 @@ impl Worker {
                         for _ in 0..self.threads {
                             self.queue.push(Message::Quit);
                         }
+                    } else {
+                        // You're right to consider this suspicious, but it's
+                        // a useful heuristic to permit producers to catch up
+                        // to consumers without burning the CPU. It is also
+                        // useful as a means to prevent burning the CPU if only
+                        // one worker is left doing actual work. It's not
+                        // perfect and it doesn't leave the CPU completely
+                        // idle, but it's not clear what else we can do. :-/
+                        thread::sleep(Duration::from_millis(1));
                     }
-                    continue;
                 }
             }
         }
@@ -1147,6 +1315,30 @@ fn check_symlink_loop(
     Ok(())
 }
 
+// Before calling this function, make sure that you ensure that is really
+// necessary as the arguments imply a file stat.
+fn skip_filesize(
+    max_filesize: u64,
+    path: &Path,
+    ent: &Option<Metadata>
+) -> bool {
+    let filesize = match *ent {
+        Some(ref md) => Some(md.len()),
+        None => None
+    };
+
+    if let Some(fs) = filesize {
+        if fs > max_filesize {
+            debug!("ignoring {}: {} bytes", path.display(), fs);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
 fn skip_path(ig: &Ignore, path: &Path, is_dir: bool) -> bool {
     let m = ig.matched(path, is_dir);
     if m.is_ignore() {
@@ -1174,6 +1366,11 @@ mod tests {
     fn wfile<P: AsRef<Path>>(path: P, contents: &str) {
         let mut file = File::create(path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
+    }
+
+    fn wfile_size<P: AsRef<Path>>(path: P, size: u64) {
+        let file = File::create(path).unwrap();
+        file.set_len(size).unwrap();
     }
 
     #[cfg(unix)]
@@ -1329,6 +1526,32 @@ mod tests {
         assert_paths(td.path(), builder.max_depth(Some(1)), &["a", "foo"]);
         assert_paths(td.path(), builder.max_depth(Some(2)), &[
             "a", "a/b", "foo", "a/foo",
+        ]);
+    }
+
+    #[test]
+    fn max_filesize() {
+        let td = TempDir::new("walk-test-").unwrap();
+        mkdirp(td.path().join("a/b"));
+        wfile_size(td.path().join("foo"), 0);
+        wfile_size(td.path().join("bar"), 400);
+        wfile_size(td.path().join("baz"), 600);
+        wfile_size(td.path().join("a/foo"), 600);
+        wfile_size(td.path().join("a/bar"), 500);
+        wfile_size(td.path().join("a/baz"), 200);
+
+        let mut builder = WalkBuilder::new(td.path());
+        assert_paths(td.path(), &builder, &[
+            "a", "a/b", "foo", "bar", "baz", "a/foo", "a/bar", "a/baz",
+        ]);
+        assert_paths(td.path(), builder.max_filesize(Some(0)), &[
+            "a", "a/b", "foo"
+        ]);
+        assert_paths(td.path(), builder.max_filesize(Some(500)), &[
+            "a", "a/b", "foo", "bar", "a/bar", "a/baz"
+        ]);
+        assert_paths(td.path(), builder.max_filesize(Some(50000)), &[
+            "a", "a/b", "foo", "bar", "baz", "a/foo", "a/bar", "a/baz",
         ]);
     }
 

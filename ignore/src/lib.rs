@@ -44,6 +44,8 @@ for result in WalkBuilder::new("./").hidden(false).build() {
 See the documentation for `WalkBuilder` for many other options.
 */
 
+#![deny(missing_docs)]
+
 extern crate crossbeam;
 extern crate globset;
 #[macro_use]
@@ -78,19 +80,49 @@ pub enum Error {
     /// file partially succeeded.
     Partial(Vec<Error>),
     /// An error associated with a specific line number.
-    WithLineNumber { line: u64, err: Box<Error> },
+    WithLineNumber {
+        /// The line number.
+        line: u64,
+        /// The underlying error.
+        err: Box<Error>,
+    },
     /// An error associated with a particular file path.
-    WithPath { path: PathBuf, err: Box<Error> },
+    WithPath {
+        /// The file path.
+        path: PathBuf,
+        /// The underlying error.
+        err: Box<Error>,
+    },
     /// An error associated with a particular directory depth when recursively
     /// walking a directory.
-    WithDepth { depth: usize, err: Box<Error> },
+    WithDepth {
+        /// The directory depth.
+        depth: usize,
+        /// The underlying error.
+        err: Box<Error>,
+    },
     /// An error that occurs when a file loop is detected when traversing
     /// symbolic links.
-    Loop { ancestor: PathBuf, child: PathBuf },
+    Loop {
+        /// The ancestor file path in the loop.
+        ancestor: PathBuf,
+        /// The child file path in the loop.
+        child: PathBuf,
+    },
     /// An error that occurs when doing I/O, such as reading an ignore file.
     Io(io::Error),
     /// An error that occurs when trying to parse a glob.
-    Glob(String),
+    Glob {
+        /// The original glob that caused this error. This glob, when
+        /// available, always corresponds to the glob provided by an end user.
+        /// e.g., It is the glob as writtein in a `.gitignore` file.
+        ///
+        /// (This glob may be distinct from the glob that is actually
+        /// compiled, after accounting for `gitignore` semantics.)
+        glob: Option<String>,
+        /// The underlying glob error as a string.
+        err: String,
+    },
     /// A type selection for a file type that is not defined.
     UnrecognizedFileType(String),
     /// A user specified file type definition could not be parsed.
@@ -122,7 +154,7 @@ impl Error {
             Error::WithDepth { ref err, .. } => err.is_io(),
             Error::Loop { .. } => false,
             Error::Io(_) => true,
-            Error::Glob(_) => false,
+            Error::Glob { .. } => false,
             Error::UnrecognizedFileType(_) => false,
             Error::InvalidDefinition => false,
         }
@@ -177,7 +209,7 @@ impl error::Error for Error {
             Error::WithDepth { ref err, .. } => err.description(),
             Error::Loop { .. } => "file system loop found",
             Error::Io(ref err) => err.description(),
-            Error::Glob(ref msg) => msg,
+            Error::Glob { ref err, .. } => err,
             Error::UnrecognizedFileType(_) => "unrecognized file type",
             Error::InvalidDefinition => "invalid definition",
         }
@@ -205,7 +237,10 @@ impl fmt::Display for Error {
                           child.display(), ancestor.display())
             }
             Error::Io(ref err) => err.fmt(f),
-            Error::Glob(ref msg) => write!(f, "{}", msg),
+            Error::Glob { glob: None, ref err } => write!(f, "{}", err),
+            Error::Glob { glob: Some(ref glob), ref err } => {
+                write!(f, "error parsing glob '{}': {}", glob, err)
+            }
             Error::UnrecognizedFileType(ref ty) => {
                 write!(f, "unrecognized file type: {}", ty)
             }

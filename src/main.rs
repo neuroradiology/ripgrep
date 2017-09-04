@@ -1,38 +1,29 @@
-#![allow(dead_code, unused_imports)]
-
+extern crate atty;
 extern crate bytecount;
 #[macro_use]
 extern crate clap;
-extern crate ctrlc;
+extern crate encoding_rs;
 extern crate env_logger;
 extern crate grep;
 extern crate ignore;
-#[cfg(windows)]
-extern crate kernel32;
 #[macro_use]
 extern crate lazy_static;
-extern crate libc;
 #[macro_use]
 extern crate log;
 extern crate memchr;
 extern crate memmap;
 extern crate num_cpus;
 extern crate regex;
+extern crate same_file;
 extern crate termcolor;
-#[cfg(windows)]
-extern crate winapi;
 
 use std::error::Error;
-use std::io;
-use std::io::Write;
 use std::process;
 use std::result;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
-
-use termcolor::WriteColor;
 
 use args::Args;
 use worker::Work;
@@ -52,7 +43,7 @@ macro_rules! eprintln {
 
 mod app;
 mod args;
-mod atty;
+mod decoder;
 mod pathutil;
 mod printer;
 mod search_buffer;
@@ -63,6 +54,7 @@ mod worker;
 pub type Result<T> = result::Result<T, Box<Error + Send + Sync>>;
 
 fn main() {
+    reset_sigpipe();
     match Args::parse().map(Arc::new).and_then(run) {
         Ok(0) => process::exit(1),
         Ok(_) => process::exit(0),
@@ -76,15 +68,6 @@ fn main() {
 fn run(args: Arc<Args>) -> Result<u64> {
     if args.never_match() {
         return Ok(0);
-    }
-    {
-        let args = args.clone();
-        ctrlc::set_handler(move || {
-            let mut writer = args.stdout();
-            let _ = writer.reset();
-            let _ = writer.flush();
-            process::exit(1);
-        });
     }
     let threads = args.threads();
     if args.files() {
@@ -104,7 +87,7 @@ fn run(args: Arc<Args>) -> Result<u64> {
 
 fn run_parallel(args: Arc<Args>) -> Result<u64> {
     let bufwtr = Arc::new(args.buffer_writer());
-    let quiet_matched = QuietMatched::new(args.quiet());
+    let quiet_matched = args.quiet_matched();
     let paths_searched = Arc::new(AtomicUsize::new(0));
     let match_count = Arc::new(AtomicUsize::new(0));
 
@@ -122,7 +105,11 @@ fn run_parallel(args: Arc<Args>) -> Result<u64> {
             if quiet_matched.has_match() {
                 return Quit;
             }
-            let dent = match get_or_log_dir_entry(result, args.no_messages()) {
+            let dent = match get_or_log_dir_entry(
+                result,
+                args.stdout_handle(),
+                args.no_messages(),
+            ) {
                 None => return Continue,
                 Some(dent) => dent,
             };
@@ -164,7 +151,11 @@ fn run_one_thread(args: Arc<Args>) -> Result<u64> {
     let mut paths_searched: u64 = 0;
     let mut match_count = 0;
     for result in args.walker() {
-        let dent = match get_or_log_dir_entry(result, args.no_messages()) {
+        let dent = match get_or_log_dir_entry(
+            result,
+            args.stdout_handle(),
+            args.no_messages(),
+        ) {
             None => continue,
             Some(dent) => dent,
         };
@@ -201,16 +192,22 @@ fn run_files_parallel(args: Arc<Args>) -> Result<u64> {
         let mut printer = print_args.printer(stdout.lock());
         let mut file_count = 0;
         for dent in rx.iter() {
-            printer.path(dent.path());
+            if !print_args.quiet() {
+                printer.path(dent.path());
+            }
             file_count += 1;
         }
         file_count
     });
-    let no_messages = args.no_messages();
     args.walker_parallel().run(move || {
+        let args = args.clone();
         let tx = tx.clone();
         Box::new(move |result| {
-            if let Some(dent) = get_or_log_dir_entry(result, no_messages) {
+            if let Some(dent) = get_or_log_dir_entry(
+                result,
+                args.stdout_handle(),
+                args.no_messages(),
+            ) {
                 tx.send(dent).unwrap();
             }
             ignore::WalkState::Continue
@@ -224,11 +221,17 @@ fn run_files_one_thread(args: Arc<Args>) -> Result<u64> {
     let mut printer = args.printer(stdout.lock());
     let mut file_count = 0;
     for result in args.walker() {
-        let dent = match get_or_log_dir_entry(result, args.no_messages()) {
+        let dent = match get_or_log_dir_entry(
+            result,
+            args.stdout_handle(),
+            args.no_messages(),
+        ) {
             None => continue,
             Some(dent) => dent,
         };
-        printer.path(dent.path());
+        if !args.quiet() {
+            printer.path(dent.path());
+        }
         file_count += 1;
     }
     Ok(file_count)
@@ -247,6 +250,7 @@ fn run_types(args: Arc<Args>) -> Result<u64> {
 
 fn get_or_log_dir_entry(
     result: result::Result<ignore::DirEntry, ignore::Error>,
+    stdout_handle: Option<&same_file::Handle>,
     no_messages: bool,
 ) -> Option<ignore::DirEntry> {
     match result {
@@ -269,28 +273,56 @@ fn get_or_log_dir_entry(
             // A depth of 0 means the user gave the path explicitly, so we
             // should always try to search it.
             if dent.depth() == 0 && !ft.is_dir() {
-                Some(dent)
-            } else if ft.is_file() {
-                Some(dent)
-            } else {
-                None
+                return Some(dent);
+            } else if !ft.is_file() {
+                return None;
             }
+            // If we are redirecting stdout to a file, then don't search that
+            // file.
+            if is_stdout_file(&dent, stdout_handle, no_messages) {
+                return None;
+            }
+            Some(dent)
         }
     }
 }
 
-fn version() -> String {
-    let (maj, min, pat) = (
-        option_env!("CARGO_PKG_VERSION_MAJOR"),
-        option_env!("CARGO_PKG_VERSION_MINOR"),
-        option_env!("CARGO_PKG_VERSION_PATCH"),
-    );
-    match (maj, min, pat) {
-        (Some(maj), Some(min), Some(pat)) => {
-            format!("ripgrep {}.{}.{}", maj, min, pat)
-        }
-        _ => "".to_owned(),
+fn is_stdout_file(
+    dent: &ignore::DirEntry,
+    stdout_handle: Option<&same_file::Handle>,
+    no_messages: bool,
+) -> bool {
+    let stdout_handle = match stdout_handle {
+        None => return false,
+        Some(stdout_handle) => stdout_handle,
+    };
+    // If we know for sure that these two things aren't equal, then avoid
+    // the costly extra stat call to determine equality.
+    if !maybe_dent_eq_handle(dent, stdout_handle) {
+        return false;
     }
+    match same_file::Handle::from_path(dent.path()) {
+        Ok(h) => stdout_handle == &h,
+        Err(err) => {
+            if !no_messages {
+                eprintln!("{}: {}", dent.path().display(), err);
+            }
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+fn maybe_dent_eq_handle(
+    dent: &ignore::DirEntry,
+    handle: &same_file::Handle,
+) -> bool {
+    dent.ino() == Some(handle.ino())
+}
+
+#[cfg(not(unix))]
+fn maybe_dent_eq_handle(_: &ignore::DirEntry, _: &same_file::Handle) -> bool {
+    true
 }
 
 fn eprint_nothing_searched() {
@@ -299,41 +331,21 @@ fn eprint_nothing_searched() {
                Try running again with --debug.");
 }
 
-/// A simple thread safe abstraction for determining whether a search should
-/// stop if the user has requested quiet mode.
-#[derive(Clone, Debug)]
-pub struct QuietMatched(Arc<Option<AtomicBool>>);
-
-impl QuietMatched {
-    /// Create a new QuietMatched value.
-    ///
-    /// If quiet is true, then set_match and has_match will reflect whether
-    /// a search should quit or not because it found a match.
-    ///
-    /// If quiet is false, then set_match is always a no-op and has_match
-    /// always returns false.
-    pub fn new(quiet: bool) -> QuietMatched {
-        let atomic = if quiet { Some(AtomicBool::new(false)) } else { None };
-        QuietMatched(Arc::new(atomic))
+// The Rust standard library suppresses the default SIGPIPE behavior, so that
+// writing to a closed pipe doesn't kill the process. The goal is to instead
+// handle errors through the normal result mechanism. Ripgrep needs some
+// refactoring before it will be able to do that, however, so we re-enable the
+// standard SIGPIPE behavior as a workaround. See
+// https://github.com/BurntSushi/ripgrep/issues/200.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    extern crate libc;
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+}
 
-    /// Returns true if and only if quiet mode is enabled and a match has
-    /// occurred.
-    pub fn has_match(&self) -> bool {
-        match *self.0 {
-            None => false,
-            Some(ref matched) => matched.load(Ordering::SeqCst),
-        }
-    }
-
-    /// Sets whether a match has occurred or not.
-    ///
-    /// If quiet mode is disabled, then this is a no-op.
-    pub fn set_match(&self, yes: bool) -> bool {
-        match *self.0 {
-            None => false,
-            Some(_) if !yes => false,
-            Some(ref m) => { m.store(true, Ordering::SeqCst); true }
-        }
-    }
+#[cfg(not(unix))]
+fn reset_sigpipe() {
+    // no-op
 }

@@ -2,8 +2,8 @@ use std::io;
 use std::mem;
 
 use kernel32;
-use winapi::{DWORD, HANDLE, WORD};
-use winapi::winbase::STD_OUTPUT_HANDLE;
+use winapi::{DWORD, WORD};
+use winapi::winbase::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
 use winapi::wincon::{
     FOREGROUND_BLUE as FG_BLUE,
     FOREGROUND_GREEN as FG_GREEN,
@@ -30,45 +30,50 @@ const FG_WHITE: DWORD = FG_BLUE | FG_GREEN | FG_RED;
 /// stdout before setting new text attributes.
 #[derive(Debug)]
 pub struct Console {
-    handle: HANDLE,
+    handle_id: DWORD,
     start_attr: TextAttributes,
     cur_attr: TextAttributes,
 }
 
-unsafe impl Send for Console {}
-
-impl Drop for Console {
-    fn drop(&mut self) {
-        unsafe { kernel32::CloseHandle(self.handle); }
-    }
-}
-
 impl Console {
-    /// Create a new Console to stdout.
-    ///
-    /// If there was a problem creating the console, then an error is returned.
-    pub fn stdout() -> io::Result<Console> {
+    /// Get a console for a standard I/O stream.
+    fn create_for_stream(handle_id: DWORD) -> io::Result<Console> {
         let mut info = unsafe { mem::zeroed() };
-        let (handle, res) = unsafe {
-            let handle = kernel32::GetStdHandle(STD_OUTPUT_HANDLE);
-            (handle, kernel32::GetConsoleScreenBufferInfo(handle, &mut info))
+        let res = unsafe {
+            let handle = kernel32::GetStdHandle(handle_id);
+            kernel32::GetConsoleScreenBufferInfo(handle, &mut info)
         };
         if res == 0 {
             return Err(io::Error::last_os_error());
         }
         let attr = TextAttributes::from_word(info.wAttributes);
         Ok(Console {
-            handle: handle,
+            handle_id: handle_id,
             start_attr: attr,
             cur_attr: attr,
         })
+    }
+
+    /// Create a new Console to stdout.
+    ///
+    /// If there was a problem creating the console, then an error is returned.
+    pub fn stdout() -> io::Result<Console> {
+        Self::create_for_stream(STD_OUTPUT_HANDLE)
+    }
+
+    /// Create a new Console to stderr.
+    ///
+    /// If there was a problem creating the console, then an error is returned.
+    pub fn stderr() -> io::Result<Console> {
+        Self::create_for_stream(STD_ERROR_HANDLE)
     }
 
     /// Applies the current text attributes.
     fn set(&mut self) -> io::Result<()> {
         let attr = self.cur_attr.to_word();
         let res = unsafe {
-            kernel32::SetConsoleTextAttribute(self.handle, attr)
+            let handle = kernel32::GetStdHandle(self.handle_id);
+            kernel32::SetConsoleTextAttribute(handle, attr)
         };
         if res == 0 {
             return Err(io::Error::last_os_error());
@@ -142,6 +147,7 @@ impl TextAttributes {
 }
 
 /// Whether to use intense colors or not.
+#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Intense {
     Yes,
@@ -174,6 +180,7 @@ impl Intense {
 }
 
 /// The set of available colors for use with a Windows console.
+#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Color {
     Black,

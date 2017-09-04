@@ -4,11 +4,11 @@ rg - recursively search current directory for lines matching a pattern
 
 # SYNOPSIS
 
-rg [*options*] <*pattern*> [*<*path*> ...*]
+rg [*options*] *PATTERN* [*path* ...]
 
-rg [*options*] (-e PATTERN | -f FILE) ... [*<*path*> ...*]
+rg [*options*] [-e *PATTERN* ...] [-f *FILE* ...] [*path* ...]
 
-rg [*options*] --files [*<*path*> ...*]
+rg [*options*] --files [*path* ...]
 
 rg [*options*] --type-list
 
@@ -25,6 +25,10 @@ ripgrep's regex engine uses finite automata and guarantees linear time
 searching. Because of this, features like backreferences and arbitrary
 lookaround are not supported.
 
+Note that ripgrep may abort unexpectedly when using default settings if it
+searches a file that is simultaneously truncated. This behavior can be avoided
+by passing the --no-mmap flag.
+
 Project home page: https://github.com/BurntSushi/ripgrep
 
 # COMMON OPTIONS
@@ -36,8 +40,10 @@ Project home page: https://github.com/BurntSushi/ripgrep
 : Only show count of line matches for each file.
 
 --color *WHEN*
-: Whether to use coloring in match. Valid values are never, always or auto.
-  [default: auto]
+: Whether to use color in the output. Valid values are never, auto, always or
+  ansi. The default is auto. When always is used, coloring is attempted based
+  on your environment. When ansi is used, coloring is forcefully done using
+  ANSI escape color codes.
 
 -e, --regexp *PATTERN* ...
 : Use PATTERN to search. This option can be provided multiple times, where all
@@ -49,8 +55,21 @@ Project home page: https://github.com/BurntSushi/ripgrep
 
 -g, --glob *GLOB* ...
 : Include or exclude files for searching that match the given glob. This always
-  overrides any other ignore logic. Multiple glob flags may be used. Globbing
-  rules match .gitignore globs. Precede a glob with a '!' to exclude it.
+  overrides any other ignore logic if there is a conflict, but is otherwise
+  applied in addition to ignore files (e.g., .gitignore or .ignore). Multiple
+  glob flags may be used. Globbing rules match .gitignore globs. Precede a
+  glob with a '!' to exclude it.
+
+    The --glob flag subsumes the functionality of both the --include and
+    --exclude flags commonly found in other tools.
+
+    Values given to -g must be quoted or your shell will expand them and result
+    in unexpected behavior.
+
+    Combine with the --files flag to return matched filenames
+    (i.e., to replicate ack/ag's -g flag). For example:
+
+        rg -g '*.foo' --files
 
 -h, --help
 : Show this usage message.
@@ -78,8 +97,12 @@ Project home page: https://github.com/BurntSushi/ripgrep
 -u, --unrestricted ...
 : Reduce the level of 'smart' searching. A single -u doesn't respect .gitignore
   (etc.) files. Two -u flags will search hidden files and directories. Three
-  -u flags will search binary files. -uu is equivalent to grep -r, and -uuu is
-  equivalent to grep -a -r.
+  -u flags will search binary files. -uu is equivalent to `grep -r`, and -uuu
+  is equivalent to `grep -a -r`.
+
+    Note that the -u flags are convenient aliases for other combinations of
+    flags. -u aliases --no-ignore. -uu aliases --no-ignore --hidden.
+    -uuu aliases --no-ignore --hidden --text.
 
 -v, --invert-match
 : Invert matching.
@@ -87,6 +110,10 @@ Project home page: https://github.com/BurntSushi/ripgrep
 -w, --word-regexp
 : Only show matches surrounded by word boundaries. This is equivalent to
   putting \\b before and after the search pattern.
+
+-x, --line-regexp
+: Only show matches surrounded by line boundaries. This is equivalent to
+  putting ^...$ around the search pattern.
 
 # LESS COMMON OPTIONS
 
@@ -103,31 +130,39 @@ Project home page: https://github.com/BurntSushi/ripgrep
 : This flag specifies color settings for use in the output. This flag may be
   provided multiple times. Settings are applied iteratively. Colors are limited
   to one of eight choices: red, blue, green, cyan, magenta, yellow, white and
-  black. Styles are limited to either nobold or bold.
+  black. Styles are limited to nobold, bold, nointense or intense.
 
     The format of the flag is {type}:{attribute}:{value}. {type} should be one
-    of path, line or match. {attribute} can be fg, bg or style. Value is either
-    a color (for fg and bg) or a text style. A special format, {type}:none,
-    will clear all color settings for {type}.
+    of path, line, column or match. {attribute} can be fg, bg or style. Value
+    is either a color (for fg and bg) or a text style. A special format,
+    {type}:none, will clear all color settings for {type}.
 
     For example, the following command will change the match color to magenta
     and the background color for line numbers to yellow:
 
-    rg --colors 'match:fg:magenta' --colors 'line:bg:yellow' foo.
+        rg --colors 'match:fg:magenta' --colors 'line:bg:yellow' foo.
 
 --column
 : Show column numbers (1 based) in output. This only shows the column
   numbers for the first match on each line. Note that this doesn't try
-  to account for Unicode. One byte is equal to one column.
+  to account for Unicode. One byte is equal to one column. This implies
+  --line-number.
 
---context-separator *ARG*
+--context-separator *SEPARATOR*
 : The string to use when separating non-continuous context lines. Escape
   sequences may be used. [default: --]
 
 --debug
 : Show debug messages.
 
--f, --file FILE ...
+-E, --encoding *ENCODING*
+: Specify the text encoding that ripgrep will use on all files
+  searched. The default value is 'auto', which will cause ripgrep to do
+  a best effort automatic detection of encoding on a per-file basis.
+  Other supported values can be found in the list of labels here:
+  https://encoding.spec.whatwg.org/#concept-encoding-get
+
+-f, --file *FILE* ...
 : Search for patterns from the given file, with one pattern per line. When this
   flag is used or multiple times or in combination with the -e/--regexp flag,
   then all patterns provided are searched. Empty pattern lines will match all
@@ -135,6 +170,10 @@ Project home page: https://github.com/BurntSushi/ripgrep
 
 --files
 : Print each file that would be searched (but don't search).
+
+    Combine with the -g flag to return matched paths, for example:
+
+        rg -g '*.foo' --files
 
 -l, --files-with-matches
 : Only show path of each file with matches.
@@ -156,14 +195,21 @@ Project home page: https://github.com/BurntSushi/ripgrep
 
 --no-heading
 : Don't group matches by each file. If -H/--with-filename is enabled, then
-  file names will be shown for every line matched. This is the default more
+  file names will be shown for every line matched. This is the default mode
   when not at a tty.
 
 --hidden
 : Search hidden directories and files. (Hidden directories and files are
   skipped by default.)
 
---ignore-file FILE ...
+--iglob *GLOB* ...
+: Include or exclude files/directories case insensitively. This always
+  overrides any other ignore logic if there is a conflict, but is otherwise
+  applied in addition to ignore files (e.g., .gitignore or .ignore). Multiple
+  glob flags may be used. Globbing rules match .gitignore globs. Precede a
+  glob with a '!' to exclude it.
+
+--ignore-file *FILE* ...
 : Specify additional ignore files for filtering file paths.
   Ignore files should be in the gitignore format and are matched
   relative to the current working directory. These ignore files
@@ -174,8 +220,19 @@ Project home page: https://github.com/BurntSushi/ripgrep
 -L, --follow
 : Follow symlinks.
 
--m, --max-count NUM
+-M, --max-columns *NUM*
+: Don't print lines longer than this limit in bytes. Longer lines are omitted,
+  and only the number of matches in that line is printed.
+
+-m, --max-count *NUM*
 : Limit the number of matching lines per file searched to NUM.
+
+--max-filesize *NUM*+*SUFFIX*?
+: Ignore files larger than *NUM* in size. Directories will never be ignored.
+
+    *SUFFIX* is optional and may be one of K, M or G. These correspond to
+    kilobytes, megabytes and gigabytes respectively. If omitted the input is
+    treated as bytes.
 
 --maxdepth *NUM*
 : Descend at most NUM directories below the command line arguments.
@@ -203,14 +260,24 @@ Project home page: https://github.com/BurntSushi/ripgrep
 : Don't respect version control ignore files (e.g., .gitignore).
   Note that .ignore files will continue to be respected.
 
---null
+-0, --null
 : Whenever a file name is printed, follow it with a NUL byte.
   This includes printing filenames before matches, and when printing
   a list of matching files such as with --count, --files-with-matches
   and --files.
 
+-o, --only-matching
+: Print only the matched (non-empty) parts of a matching line, with each such
+  part on a separate output line.
+
+--path-separator *SEPARATOR*
+: The path separator to use when printing file paths. This defaults to your
+  platform's path separator, which is / on Unix and \\ on Windows. This flag is
+  intended for overriding the default when the environment demands it (e.g.,
+  cygwin). A path separator is limited to a single byte.
+
 -p, --pretty
-: Alias for --color=always --heading -n.
+: Alias for --color=always --heading --line-number.
 
 -r, --replace *ARG*
 : Replace every match with the string given when printing search results.
@@ -218,6 +285,12 @@ Project home page: https://github.com/BurntSushi/ripgrep
 
     Capture group indices (e.g., $5) and names (e.g., $foo) are supported
     in the replacement string.
+
+    Note that the replacement by default replaces each match, and NOT the
+    entire line. To replace the entire line, you should match the entire line.
+    For example, to emit only the first phone numbers in each line:
+
+        rg '^.*([0-9]{3}-[0-9]{3}-[0-9]{4}).*$' --replace '$1'
 
 -s, --case-sensitive
 : Search case sensitively. This overrides --ignore-case and --smart-case.
@@ -227,17 +300,29 @@ Project home page: https://github.com/BurntSushi/ripgrep
   Search case sensitively otherwise. This is overridden by either
   --case-sensitive or --ignore-case.
 
+--sort-files
+: Sort results by file path. Note that this currently
+  disables all parallelism and runs search in a single thread.
+
 -j, --threads *ARG*
 : The number of threads to use. 0 means use the number of logical CPUs
-  (capped at 6). [default: 0]
+  (capped at 12). [default: 0]
 
 --version
 : Show the version number of ripgrep and exit.
 
 --vimgrep
-: Show results with every match on its own line, including line
-  numbers and column numbers. (With this option, a line with more
-  than one match of the regex will be printed more than once.)
+: Show results with every match on its own line, including
+  line numbers and column numbers. With this option, a line with
+  more than one match will be printed more than once.
+
+      Recommended .vimrc configuration:
+
+          set grepprg=rg\ --vimgrep
+          set grepformat^=%f:%l:%c:%m
+
+      Use :grep to grep for something, then :cn and :cp to navigate through the
+      matches.
 
 # FILE TYPE MANAGEMENT OPTIONS
 
@@ -249,11 +334,39 @@ Project home page: https://github.com/BurntSushi/ripgrep
   at a time. Multiple --type-add flags can be provided. Unless --type-clear
   is used, globs are added to any existing globs inside of ripgrep. Note that
   this must be passed to every invocation of rg. Type settings are NOT
-  persisted.
+  persisted. Example:
 
-      Example: `rg --type-add 'foo:*.foo' -tfoo PATTERN`
+          rg --type-add 'foo:*.foo' -tfoo PATTERN
+
+      --type-add can also be used to include rules from other types
+      with the special include directive. The include directive
+      permits specifying one or more other type names (separated by a
+      comma) that have been defined and its rules will automatically
+      be imported into the type specified. For example, to create a
+      type called src that matches C++, Python and Markdown files, one
+      can use:
+
+          --type-add 'src:include:cpp,py,md'
+
+      Additional glob rules can still be added to the src type by
+      using the --type-add flag again:
+
+          --type-add 'src:include:cpp,py,md' --type-add 'src:*.foo'
+
+      Note that type names must consist only of Unicode letters or
+      numbers. Punctuation characters are not allowed.
 
 --type-clear *TYPE* ...
 : Clear the file type globs previously defined for TYPE. This only clears
   the default type definitions that are found inside of ripgrep. Note
   that this must be passed to every invocation of rg.
+
+# SHELL COMPLETION
+
+Shell completion files are included in the release tarball for Bash, Fish, Zsh
+and PowerShell.
+
+For **bash**, move `rg.bash-completion` to `$XDG_CONFIG_HOME/bash_completion`
+or `/etc/bash_completion.d/`.
+
+For **fish**, move `rg.fish` to `$HOME/.config/fish/completions`.

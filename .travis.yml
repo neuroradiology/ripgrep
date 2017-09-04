@@ -3,6 +3,14 @@ language: rust
 env:
   global:
     - PROJECT_NAME=ripgrep
+    - RUST_BACKTRACE: full
+
+addons:
+  apt:
+    packages:
+      # Needed for completion-function test
+      - zsh
+
 matrix:
   include:
     # Nightly channel.
@@ -24,16 +32,13 @@ matrix:
     - os: linux
       rust: beta
       env: TARGET=x86_64-unknown-linux-gnu
-    - os: osx
-      rust: beta
-      env: TARGET=x86_64-apple-darwin
     # Minimum Rust supported channel.
     - os: linux
-      rust: 1.11.0
+      rust: 1.17.0
       env: TARGET=x86_64-unknown-linux-gnu
-    - os: osx
-      rust: 1.11.0
-      env: TARGET=x86_64-apple-darwin
+    - os: linux
+      rust: 1.17.0
+      env: TARGET=x86_64-unknown-linux-musl
 
 before_install:
   - export PATH="$PATH:$HOME/.cargo/bin"

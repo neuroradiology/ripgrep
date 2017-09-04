@@ -1,21 +1,21 @@
 ripgrep (rg)
 ------------
 `ripgrep` is a line oriented search tool that combines the usability of The
-Silver Searcher (an `ack` clone) with the raw speed of GNU grep. `ripgrep`
+Silver Searcher (similar to `ack`) with the raw speed of GNU grep. `ripgrep`
 works by recursively searching your current directory for a regex pattern.
 `ripgrep` has first class support on Windows, Mac and Linux, with binary
 downloads available for
 [every release](https://github.com/BurntSushi/ripgrep/releases).
-
-ripgrep's regex engine uses finite automata and guarantees linear time
-searching. Because of this, features like backreferences and arbitrary
-lookaround are not supported.
 
 [![Linux build status](https://travis-ci.org/BurntSushi/ripgrep.svg?branch=master)](https://travis-ci.org/BurntSushi/ripgrep)
 [![Windows build status](https://ci.appveyor.com/api/projects/status/github/BurntSushi/ripgrep?svg=true)](https://ci.appveyor.com/project/BurntSushi/ripgrep)
 [![](https://img.shields.io/crates/v/ripgrep.svg)](https://crates.io/crates/ripgrep)
 
 Dual-licensed under MIT or the [UNLICENSE](http://unlicense.org).
+
+### CHANGELOG
+
+Please see the [CHANGELOG](CHANGELOG.md) for a release history.
 
 ### Screenshot of search results
 
@@ -87,9 +87,34 @@ increases the times to `3.081s` for ripgrep and `11.403s` for GNU grep.
   of search results, searching multiple patterns, highlighting matches with
   color and full Unicode support. Unlike GNU grep, `ripgrep` stays fast while
   supporting Unicode (which is always on).
+* `ripgrep` supports searching files in text encodings other than UTF-8, such
+  as UTF-16, latin-1, GBK, EUC-JP, Shift_JIS and more. (Some support for
+  automatically detecting UTF-16 is provided. Other text encodings must be
+  specifically specified with the `-E/--encoding` flag.)
 
-In other words, use `ripgrep` if you like speed, sane defaults, fewer bugs and
-Unicode.
+In other words, use `ripgrep` if you like speed, filtering by default, fewer
+bugs and Unicode support.
+
+### Why shouldn't I use `ripgrep`?
+
+I'd like to try to convince you why you *shouldn't* use `ripgrep`. This should
+give you a glimpse at some important downsides or missing features of
+`ripgrep`.
+
+* `ripgrep` uses a regex engine based on finite automata, so if you want fancy
+  regex features such as backreferences or look around, `ripgrep` won't give
+  them to you. `ripgrep` does support lots of things though, including, but not
+  limited to: lazy quantification (e.g., `a+?`), repetitions (e.g., `a{2,5}`),
+  begin/end assertions (e.g., `^\w+$`), word boundaries (e.g., `\bfoo\b`), and
+  support for Unicode categories (e.g., `\p{Sc}` to match currency symbols or
+  `\p{Lu}` to match any uppercase letter). (Fancier regexes will never be
+  supported.)
+* `ripgrep` doesn't yet support searching compressed files. (Likely to be
+  supported in the future.)
+* `ripgrep` doesn't have multiline search. (Unlikely to ever be supported.)
+
+In other words, if you like fancy regexes, searching compressed files or
+multiline search, then `ripgrep` may not quite meet your needs (yet).
 
 ### Is it really faster than everything else?
 
@@ -144,6 +169,12 @@ $ brew tap burntsushi/ripgrep https://github.com/BurntSushi/ripgrep.git
 $ brew install burntsushi/ripgrep/ripgrep-bin
 ```
 
+If you're a **Windows Chocolatey** user, then you can install `ripgrep` from the [official repo](https://chocolatey.org/packages/ripgrep):
+
+```
+$ choco install ripgrep
+```
+
 If you're an **Arch Linux** user, then you can install `ripgrep` from the official repos:
 
 ```
@@ -156,17 +187,17 @@ If you're a **Gentoo** user, you can install `ripgrep` from the [official repo](
 $ emerge ripgrep
 ```
 
-If you're a **Fedora 24+** user, you can install `ripgrep` from [copr](https://copr.fedorainfracloud.org/coprs/carlgeorge/ripgrep/):
+If you're a **Fedora 24+** user, you can install `ripgrep` from [copr](https://copr.fedorainfracloud.org/coprs/carlwgeorge/ripgrep/):
 
 ```
-$ dnf copr enable carlgeorge/ripgrep
+$ dnf copr enable carlwgeorge/ripgrep
 $ dnf install ripgrep
 ```
 
-If you're a **RHEL/CentOS 7** user, you can install `ripgrep` from [copr](https://copr.fedorainfracloud.org/coprs/carlgeorge/ripgrep/):
+If you're a **RHEL/CentOS 7** user, you can install `ripgrep` from [copr](https://copr.fedorainfracloud.org/coprs/carlwgeorge/ripgrep/):
 
 ```
-$ yum-config-manager --add-repo=https://copr.fedorainfracloud.org/coprs/carlgeorge/ripgrep/repo/epel-7/carlgeorge-ripgrep-epel-7.repo
+$ yum-config-manager --add-repo=https://copr.fedorainfracloud.org/coprs/carlwgeorge/ripgrep/repo/epel-7/carlwgeorge-ripgrep-epel-7.repo
 $ yum install ripgrep
 ```
 
@@ -178,7 +209,9 @@ $ nix-env --install ripgrep
 $ # (Or using the attribute name, which is also `ripgrep`.)
 ```
 
-If you're a **Rust programmer**, `ripgrep` can be installed with `cargo`:
+If you're a **Rust programmer**, `ripgrep` can be installed with `cargo`. Note
+that the minimum supported version of Rust for ripgrep is **1.17**, although
+ripgrep may work with older versions.
 
 ```
 $ cargo install ripgrep
@@ -198,11 +231,10 @@ colorize your output and show line numbers, just like The Silver Searcher.
 Coloring works on Windows too! Colors can be controlled more granularly with
 the `--color` flag.
 
-One last thing before we get started: `ripgrep` assumes UTF-8 *everywhere*. It
-can still search files that are invalid UTF-8 (like, say, latin-1), but it will
-simply not work on UTF-16 encoded files or other more exotic encodings.
-[Support for other encodings may
-happen.](https://github.com/BurntSushi/ripgrep/issues/1)
+One last thing before we get started: generally speaking, `ripgrep` assumes the
+input is reading is UTF-8. However, if ripgrep notices a file is encoded as
+UTF-16, then it will know how to search it. For other encodings, you'll need to
+explicitly specify them with the `-E/--encoding` flag.
 
 To recursively search the current directory, while respecting all `.gitignore`
 files, ignore hidden files and directories and skip binary files:
@@ -268,6 +300,12 @@ Or exclude files matching a particular glob:
 $ rg foo -g '!*.min.js'
 ```
 
+Search and return paths matching a particular glob (i.e., `-g` flag in ag/ack):
+
+```
+$ rg -g 'doc*' --files
+```
+
 Search only HTML and CSS files:
 
 ```
@@ -296,11 +334,28 @@ extensions.
 The syntax supported is
 [documented as part of Rust's regex library](https://doc.rust-lang.org/regex/regex/index.html#syntax).
 
+### Shell completions
+
+Shell completion files are included in the release tarball for Bash, Fish, Zsh
+and PowerShell.
+
+For **bash**, move `complete/rg.bash-completion` to `$XDG_CONFIG_HOME/bash_completion`
+or `/etc/bash_completion.d/`.
+
+For **fish**, move `complete/rg.fish` to `$HOME/.config/fish/completions/`.
+
+For **PowerShell**, add `. _rg.ps1` to your PowerShell
+[profile](https://technet.microsoft.com/en-us/library/bb613488(v=vs.85).aspx)
+(note the leading period). If the `_rg.ps1` file is not on your `PATH`, do
+`. /path/to/_rg.ps1` instead.
+
+For **zsh**, move `complete/_rg` to one of your `$fpath` directories.
+
 ### Building
 
 `ripgrep` is written in Rust, so you'll need to grab a
 [Rust installation](https://www.rust-lang.org/) in order to compile it.
-`ripgrep` compiles with Rust 1.9 (stable) or newer. Building is easy:
+`ripgrep` compiles with Rust 1.17 (stable) or newer. Building is easy:
 
 ```
 $ git clone https://github.com/BurntSushi/ripgrep
@@ -330,3 +385,98 @@ $ cargo test
 ```
 
 from the repository root.
+
+### Tips
+
+#### Windows Powershell
+
+##### Powershell Profile
+
+To customize powershell on start-up there is a special powershell script that has to be created.
+In order to find its location type `$profile`
+See [more](https://technet.microsoft.com/en-us/library/bb613488(v=vs.85).aspx) for profile details.
+
+Any powershell code in this file gets evaluated at the start of console.
+This way you can have own aliases to be created at start.
+
+##### Setup function alias
+
+Often you can find a need to make alias for the favourite utility.
+
+But powershell function aliases do not behave like your typical linux shell alias.
+
+You always need to propagate arguments and **Stdin** input.
+But it cannot be done simply as `function grep() { $input | rg.exe --hidden $args }`
+
+Use below example as reference to how setup alias in powershell.
+
+```powershell
+function grep {
+    $count = @($input).Count
+    $input.Reset()
+
+    if ($count) {
+        $input | rg.exe --hidden $args
+    }
+    else {
+        rg.exe --hidden $args
+    }
+}
+```
+
+Powershell special variables:
+* input - is powershell **Stdin** object that allows you to access its content.
+* args - is array of arguments passed to this function.
+
+This alias checks whether there is **Stdin** input and propagates only if there is some lines.
+Otherwise empty `$input` will make powershell to trigger `rg` to search empty **Stdin**
+
+##### Piping non-ASCII content to ripgrep
+
+When piping input into native executables in PowerShell, the encoding of the
+input is controlled by the `$OutputEncoding` variable. By default, this is set
+to US-ASCII, and any characters in the pipeline that don't have encodings in
+US-ASCII are converted to `?` (question mark) characters.
+
+To change this setting, set `$OutputEncoding` to a different encoding, as
+represented by a .NET encoding object. Some common examples are below. The
+value of this variable is reset when PowerShell restarts, so to make this
+change take effect every time PowerShell is started add a line setting the
+variable into your PowerShell profile.
+
+Example `$OutputEncoding` settings:
+* UTF-8 without BOM: `$OutputEncoding = [System.Text.UTF8Encoding]::new()`
+* The console's output encoding:
+`$OutputEncoding = [System.Console]::OutputEncoding`
+
+If you continue to have encoding problems, you can also force the encoding
+that the console will use for printing to UTF-8 with
+`[System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8`. This
+will also reset when PowerShell is restarted, so you can add that line
+to your profile as well if you want to make the setting permanent.
+
+### Known issues
+
+#### I just hit Ctrl+C in the middle of ripgrep's output and now my terminal's foreground color is wrong!
+
+Type in `color` in cmd.exe (Command Prompt) and `echo -ne "\033[0m"` on Unix
+to restore your original foreground color.
+
+In PowerShell, you can add the following code to your profile which will
+restore the original foreground color when `Reset-ForegroundColor` is called.
+Including the `Set-Alias` line will allow you to call it with simply `color`.
+
+```powershell
+$OrigFgColor = $Host.UI.RawUI.ForegroundColor
+function Reset-ForegroundColor {
+	$Host.UI.RawUI.ForegroundColor = $OrigFgColor
+}
+Set-Alias -Name color -Value Reset-ForegroundColor
+```
+
+PR [#187](https://github.com/BurntSushi/ripgrep/pull/187) fixed this, and it
+was later deprecated in
+[#281](https://github.com/BurntSushi/ripgrep/issues/281). A full explanation is
+available [here][msys issue explanation].
+
+[msys issue explanation]: https://github.com/BurntSushi/ripgrep/issues/281#issuecomment-269093893

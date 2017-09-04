@@ -46,6 +46,13 @@ impl WorkDir {
         self.create_bytes(name, contents.as_bytes());
     }
 
+    /// Create a new file with the given name and size.
+    pub fn create_size<P: AsRef<Path>>(&self, name: P, filesize: u64) {
+        let path = self.dir.join(name);
+        let file = nice_err(&path, File::create(&path));
+        nice_err(&path, file.set_len(filesize));
+    }
+
     /// Create a new file with the given name and contents in this directory.
     pub fn create_bytes<P: AsRef<Path>>(&self, name: P, contents: &[u8]) {
         let path = self.dir.join(name);
@@ -238,6 +245,23 @@ impl WorkDir {
     pub fn assert_err(&self, cmd: &mut process::Command) {
         let o = cmd.output().unwrap();
         if o.status.success() {
+            panic!("\n\n===== {:?} =====\n\
+                    command succeeded but expected failure!\
+                    \n\ncwd: {}\
+                    \n\nstatus: {}\
+                    \n\nstdout: {}\n\nstderr: {}\
+                    \n\n=====\n",
+                   cmd, self.dir.display(), o.status,
+                   String::from_utf8_lossy(&o.stdout),
+                   String::from_utf8_lossy(&o.stderr));
+        }
+    }
+
+    /// Runs the given command and asserts that something was printed to
+    /// stderr.
+    pub fn assert_non_empty_stderr(&self, cmd: &mut process::Command) {
+        let o = cmd.output().unwrap();
+        if o.status.success() || o.stderr.is_empty() {
             panic!("\n\n===== {:?} =====\n\
                     command succeeded but expected failure!\
                     \n\ncwd: {}\
